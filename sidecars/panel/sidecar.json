@@ -1,0 +1,18 @@
+{
+  "command": "node",
+  "args": ["main.mjs"],
+  "restart_policy": "always",
+  "display_name": "AGY Todo",
+  "description": "Project-scoped personal scratchpad for saved links, todo checklists, and notes.",
+  "has_web_ui": true,
+  "ui_config": {
+    "display_name": "AGY Todo",
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "AGY Todo"
+      }
+    ]
+  }
+}

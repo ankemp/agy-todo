@@ -1,0 +1,7 @@
+{
+  "name": "agy-todo",
+  "displayName": "AGY Todo",
+  "version": "1.0.0",
+  "description": "Personal per-project scratchpad sidecar for quick links, todo lists, and notes.",
+  "logo": "assets/logo.svg"
+}

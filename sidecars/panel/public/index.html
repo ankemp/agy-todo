@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AGY Todo</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/preload.js"></script>
+</head>
+<body>
+  <main id="root" class="pane-root">
+    <section id="empty-state" class="empty-state" aria-label="No workspace open">
+      <div class="empty-card">
+        <p class="empty-title">No workspace open</p>
+        <p class="empty-description">
+          Open a project folder or repository in Antigravity to load its personal links, todos, and notes.
+        </p>
+      </div>
+    </section>
+
+    <div id="app-shell" class="app-shell" hidden>
+      <header id="app-header" class="app-header">
+        <div class="project-identity">
+          <span id="status-dot" class="status-dot" aria-hidden="true"></span>
+          <h1 id="project-name" class="project-name">Project</h1>
+          <select id="workspace-select" class="workspace-select" aria-label="Switch active workspace" hidden></select>
+        </div>
+        <div class="header-actions">
+          <span id="save-status" class="save-status" aria-live="polite">Saved</span>
+          <button id="export-btn" class="btn btn-secondary" type="button" title="Copy scratchpad as Markdown">Export .md</button>
+        </div>
+      </header>
+
+      <section id="links-section" class="links-section" aria-label="Saved links">
+        <div id="links-strip" class="links-strip">
+          <div id="links-list" class="links-list"></div>
+          <button id="toggle-link-form-btn" class="link-add-pill" type="button" aria-expanded="false" aria-controls="link-form">+ Link</button>
+        </div>
+        <form id="link-form" class="link-form" hidden>
+          <div class="link-form-fields">
+            <input id="link-label-input" class="input" type="text" placeholder="Label (optional)" aria-label="Link label" autocomplete="off">
+            <input id="link-url-input" class="input" type="text" placeholder="https://… or localhost:3000" aria-label="Link URL" autocomplete="off" required>
+          </div>
+          <div class="link-form-actions">
+            <span id="link-error" class="inline-error" role="alert" hidden></span>
+            <div class="link-form-buttons">
+              <button id="link-cancel-btn" class="btn btn-ghost" type="button">Cancel</button>
+              <button id="link-submit-btn" class="btn btn-primary" type="submit">Add</button>
+            </div>
+          </div>
+        </form>
+      </section>
+
+      <section id="todos-section" class="todos-section" aria-label="Todos">
+        <div class="section-header">
+          <div class="section-title-group">
+            <h2 class="section-title">Todos</h2>
+            <span id="todos-counts" class="todos-counts">0 open · 0 done</span>
+          </div>
+          <button id="clear-done-btn" class="btn btn-ghost btn-xs" type="button" hidden>Clear done</button>
+        </div>
+        <form id="todo-add-form" class="todo-add-form">
+          <input id="todo-input" class="input todo-input" type="text" placeholder="+ Add todo…" aria-label="Add todo" autocomplete="off">
+        </form>
+        <ul id="todos-list" class="todos-list"></ul>
+      </section>
+
+      <section id="notes-section" class="notes-section" aria-label="Notes">
+        <div class="section-header">
+          <h2 class="section-title">Notes</h2>
+        </div>
+        <textarea id="notes-input" class="notes-input" placeholder="Jot down project notes, commands, or reminders…" aria-label="Project notes"></textarea>
+      </section>
+    </div>
+  </main>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

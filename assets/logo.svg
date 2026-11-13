@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="14" y1="14" x2="114" y2="114" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1E293B" />
+      <stop offset="100%" stop-color="#0F172A" />
+    </linearGradient>
+    <linearGradient id="accent" x1="28" y1="34" x2="50" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#34D399" />
+      <stop offset="100%" stop-color="#10B981" />
+    </linearGradient>
+  </defs>
+  <rect x="14" y="14" width="100" height="100" rx="22" fill="url(#bg)" stroke="#475569" stroke-width="3" />
+  <rect x="28" y="34" width="20" height="20" rx="6" fill="url(#accent)" />
+  <path d="M33.5 44.2L37 47.7L43.5 40.5" stroke="#06281E" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" />
+  <rect x="56" y="40" width="42" height="8" rx="4" fill="#F8FAFC" />
+
+  <rect x="28" y="64" width="20" height="20" rx="6" fill="#1E293B" stroke="#38BDF8" stroke-width="3" />
+  <rect x="56" y="70" width="34" height="8" rx="4" fill="#CBD5E1" />
+
+  <rect x="28" y="92" width="70" height="6" rx="3" fill="#64748B" />
+</svg>
