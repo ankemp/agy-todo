@@ -172,7 +172,7 @@ test('standalone mode serves static assets and /preload.js with accurate MIME ty
     { path: '/', contentType: 'text/html', snippet: '<title>AGY Todo</title>' },
     { path: '/styles.css', contentType: 'text/css', snippet: '.app-shell' },
     { path: '/app.js', contentType: 'application/javascript', snippet: '/api/scratchpad' },
-    { path: '/helpers.mjs', contentType: 'application/javascript', snippet: 'createNotesAutosaver' },
+    { path: '/helpers.js', contentType: 'application/javascript', snippet: 'createNotesAutosaver' },
     { path: '/preload.js', contentType: 'application/javascript', snippet: 'window.sidecar' },
   ];
 
@@ -338,7 +338,7 @@ test('SidecarApp mode serves MIME types, persists scratchpad, and maps 400/404 e
   assert.equal(jsRes.status, 200);
   assert.ok((jsRes.headers.get('content-type') || '').includes('application/javascript'));
 
-  const helpersRes = await fetch(`${baseUrl}/helpers.mjs`);
+  const helpersRes = await fetch(`${baseUrl}/helpers.js`);
   assert.equal(helpersRes.status, 200);
   assert.ok((helpersRes.headers.get('content-type') || '').includes('application/javascript'));
 

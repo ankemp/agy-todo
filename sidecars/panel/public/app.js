@@ -1,9 +1,12 @@
-import {
+(() => {
+'use strict';
+
+const {
   partitionTodos,
   formatMarkdown,
   createNotesAutosaver,
   extractWorkspaceUrisFromMetadata,
-} from './helpers.mjs';
+} = window.AGYTodoHelpers;
 
 const emptyStateEl = document.getElementById('empty-state');
 const appShellEl = document.getElementById('app-shell');
@@ -594,6 +597,13 @@ exportBtnEl.addEventListener('click', async () => {
 
 let hasHostWorkspace = false;
 
+function showEmptyStateDetail(message) {
+  const descEl = emptyStateEl?.querySelector('.empty-description');
+  if (descEl) {
+    descEl.textContent = message;
+  }
+}
+
 async function resolveWorkspaceFromConversation() {
   const cid = window.sidecar?.conversationId;
   const getMeta = window.sidecar?.agent?.getConversationMetadata;
@@ -605,6 +615,10 @@ async function resolveWorkspaceFromConversation() {
     return extractWorkspaceUrisFromMetadata(data);
   } catch (err) {
     console.error('Failed to resolve workspace from conversation metadata:', err);
+    if (workspaceUris.length === 0) {
+      const detail = err instanceof Error ? err.message : String(err);
+      showEmptyStateDetail(`Unable to read workspace metadata (${detail}). Try toggling the plugin or reopening the pane.`);
+    }
     return [];
   }
 }
@@ -638,3 +652,5 @@ void resolveWorkspaceFromConversation().then((uris) => {
     void enqueueWorkspaceUris([]);
   }
 });
+
+})();

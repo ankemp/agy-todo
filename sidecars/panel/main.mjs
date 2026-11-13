@@ -13,7 +13,7 @@ const STATIC_ROUTES = [
   { path: '/', file: 'index.html', contentType: 'text/html; charset=utf-8' },
   { path: '/styles.css', file: 'styles.css', contentType: 'text/css; charset=utf-8' },
   { path: '/app.js', file: 'app.js', contentType: 'application/javascript; charset=utf-8' },
-  { path: '/helpers.mjs', file: 'helpers.mjs', contentType: 'application/javascript; charset=utf-8' },
+  { path: '/helpers.js', file: 'helpers.js', contentType: 'application/javascript; charset=utf-8' },
 ];
 
 const STANDALONE_PRELOAD_JS = `(() => {

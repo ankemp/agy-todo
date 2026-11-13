@@ -4,16 +4,23 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import {
+import vm from 'node:vm';
+
+const panelDir = join(dirname(fileURLToPath(import.meta.url)), '..');
+const publicDir = join(panelDir, 'public');
+
+const loadHelpers = vm.runInThisContext(
+  `(function (window, globalThis) {\n${readFileSync(join(publicDir, 'helpers.js'), 'utf8')}\nreturn window.AGYTodoHelpers;\n})`,
+  { filename: 'public/helpers.js' },
+);
+const helpersTarget = {};
+const {
   escapeHtml,
   partitionTodos,
   formatMarkdown,
   createNotesAutosaver,
   extractWorkspaceUrisFromMetadata,
-} from '../public/helpers.mjs';
-
-const panelDir = join(dirname(fileURLToPath(import.meta.url)), '..');
-const publicDir = join(panelDir, 'public');
+} = loadHelpers(helpersTarget, helpersTarget);
 
 test('escapeHtml neutralizes HTML tags and attribute quotes', () => {
   const payload = `<img src=x onerror="alert('xss')">&`;
@@ -130,12 +137,14 @@ test('createNotesAutosaver debounces rapid edits and flushes pending notes to or
   ]);
 });
 
-test('public/index.html loads preload, styles, app module, and required UI landmarks', () => {
+test('public/index.html loads preload, styles, classic helpers/app scripts, and required UI landmarks', () => {
   const html = readFileSync(join(publicDir, 'index.html'), 'utf8');
 
   assert.match(html, /<script\s+src="\/preload\.js"><\/script>/);
   assert.match(html, /<link\s+rel="stylesheet"\s+href="\/styles\.css"\s*\/?>/);
-  assert.match(html, /<script\s+type="module"\s+src="\/app\.js"><\/script>/);
+  assert.match(html, /<script\s+src="\/helpers\.js"><\/script>/);
+  assert.match(html, /<script\s+src="\/app\.js"><\/script>/);
+  assert.doesNotMatch(html, /type="module"/);
 
   // Required landmarks and controls
   assert.match(html, /id="empty-state"/);
