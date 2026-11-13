@@ -150,3 +150,47 @@ export function createNotesAutosaver({ saveFn, delayMs = 400 }) {
     hasPending,
   };
 }
+
+/**
+ * Extracts workspace folder URIs from a getConversationMetadata response.
+ * @param {unknown} data
+ * @returns {string[]}
+ */
+export function extractWorkspaceUrisFromMetadata(data) {
+  const metaEvent =
+    data?.response?.conversationMetadata ||
+    data?.response?.conversation_metadata;
+  const meta = metaEvent?.metadata;
+  if (!meta || typeof meta !== 'object') {
+    return [];
+  }
+
+  const direct = Array.isArray(meta.workspaceUris)
+    ? meta.workspaceUris
+    : Array.isArray(meta.workspace_uris)
+      ? meta.workspace_uris
+      : [];
+
+  const fromWorkspaces = Array.isArray(meta.workspaces)
+    ? meta.workspaces
+        .map(
+          (w) =>
+            w?.workspaceFolderAbsoluteUri ||
+            w?.workspace_folder_absolute_uri ||
+            w?.gitRootAbsoluteUri ||
+            w?.git_root_absolute_uri ||
+            '',
+        )
+        .filter(Boolean)
+    : [];
+
+  const seen = new Set();
+  const result = [];
+  for (const uri of [...direct, ...fromWorkspaces]) {
+    if (typeof uri === 'string' && uri.trim() && !seen.has(uri)) {
+      seen.add(uri);
+      result.push(uri);
+    }
+  }
+  return result;
+}

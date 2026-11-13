@@ -9,6 +9,7 @@ import {
   partitionTodos,
   formatMarkdown,
   createNotesAutosaver,
+  extractWorkspaceUrisFromMetadata,
 } from '../public/helpers.mjs';
 
 const panelDir = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -145,4 +146,41 @@ test('public/index.html loads preload, styles, app module, and required UI landm
   assert.match(html, /id="todos-section"/);
   assert.match(html, /id="notes-section"/);
   assert.match(html, /<textarea\b[^>]*id="notes-input"/);
+});
+
+test('extractWorkspaceUrisFromMetadata extracts and deduplicates workspace URIs', () => {
+  assert.deepEqual(
+    extractWorkspaceUrisFromMetadata({
+      response: {
+        conversationMetadata: {
+          metadata: {
+            workspaceUris: ['file:///Users/akemp/Workspace/agy-todo'],
+            workspaces: [
+              { workspaceFolderAbsoluteUri: 'file:///Users/akemp/Workspace/agy-todo' },
+              { workspaceFolderAbsoluteUri: 'file:///Users/akemp/Workspace/ledger' },
+            ],
+          },
+        },
+      },
+    }),
+    [
+      'file:///Users/akemp/Workspace/agy-todo',
+      'file:///Users/akemp/Workspace/ledger',
+    ]
+  );
+
+  assert.deepEqual(
+    extractWorkspaceUrisFromMetadata({
+      response: {
+        conversation_metadata: {
+          metadata: {
+            workspaces: [{ git_root_absolute_uri: 'file:///tmp/repo' }],
+          },
+        },
+      },
+    }),
+    ['file:///tmp/repo']
+  );
+
+  assert.deepEqual(extractWorkspaceUrisFromMetadata(null), []);
 });

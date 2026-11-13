@@ -2,6 +2,7 @@ import {
   partitionTodos,
   formatMarkdown,
   createNotesAutosaver,
+  extractWorkspaceUrisFromMetadata,
 } from './helpers.mjs';
 
 const emptyStateEl = document.getElementById('empty-state');
@@ -591,16 +592,49 @@ exportBtnEl.addEventListener('click', async () => {
   }, 1500);
 });
 
+let hasHostWorkspace = false;
+
+async function resolveWorkspaceFromConversation() {
+  const cid = window.sidecar?.conversationId;
+  const getMeta = window.sidecar?.agent?.getConversationMetadata;
+  if (!cid || typeof getMeta !== 'function') {
+    return [];
+  }
+  try {
+    const data = await getMeta(cid);
+    return extractWorkspaceUrisFromMetadata(data);
+  } catch (err) {
+    console.error('Failed to resolve workspace from conversation metadata:', err);
+    return [];
+  }
+}
+
 if (window.sidecar?.onWorkspaceChange) {
   window.sidecar.onWorkspaceChange((uris) => {
-    void enqueueWorkspaceUris(uris);
+    const list = Array.isArray(uris) ? uris.filter(Boolean) : [];
+    if (list.length > 0 || hasHostWorkspace) {
+      hasHostWorkspace = true;
+      void enqueueWorkspaceUris(list);
+    }
   });
 }
 
 if (window.sidecar?.getWorkspaceUris) {
   window.sidecar.getWorkspaceUris().then((uris) => {
-    void enqueueWorkspaceUris(uris);
+    const list = Array.isArray(uris) ? uris.filter(Boolean) : [];
+    if (list.length > 0) {
+      hasHostWorkspace = true;
+      void enqueueWorkspaceUris(list);
+    } else if (workspaceUris.length === 0) {
+      void enqueueWorkspaceUris([]);
+    }
   });
-} else {
-  void enqueueWorkspaceUris([]);
 }
+
+void resolveWorkspaceFromConversation().then((uris) => {
+  if (uris.length > 0 && workspaceUris.length === 0) {
+    void enqueueWorkspaceUris(uris);
+  } else if (!window.sidecar?.getWorkspaceUris && uris.length === 0) {
+    void enqueueWorkspaceUris([]);
+  }
+});
