@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -376,4 +376,304 @@ test('SidecarApp mode serves MIME types, persists scratchpad, and maps 400/404 e
   });
   assert.equal(missingTodo.status, 404);
   assert.ok(missingTodo.data?.error);
+});
+
+test('standalone files API routes handle save, list, import, rename, open, delete, settings, and errors', async (t) => {
+  const root = makeTempDir('agy-todo-files-api-');
+  const workspaceDir = join(root, 'proj');
+  const dataDir = join(root, 'data');
+  mkdirSync(workspaceDir, { recursive: true });
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  const externalFile = join(root, 'external.md');
+  writeFileSync(externalFile, '# External\n', 'utf8');
+
+  const outsideSecret = join(root, 'outside-secret.txt');
+  writeFileSync(outsideSecret, 'top-secret', 'utf8');
+
+  const openedCalls = [];
+  const handle = await startServer({
+    port: 0,
+    dataDir,
+    editorRunner: async (filePath, opts) => {
+      openedCalls.push({ filePath, opts });
+      return { ok: true, editor: opts.editor, command: 'mock', args: [filePath] };
+    },
+  });
+  t.after(() => handle.close());
+  const baseUrl = `http://127.0.0.1:${handle.port}`;
+  const workspaceUri = pathToFileURL(workspaceDir).href;
+
+  // Initial GET /api/files for global scope
+  const initialGlobal = await fetchJson(baseUrl, '/api/files?scope=global');
+  assert.equal(initialGlobal.status, 200);
+  assert.equal(initialGlobal.data.scope, 'global');
+  assert.deepEqual(initialGlobal.data.files, []);
+  assert.equal(initialGlobal.data.settings.defaultEditor, 'system');
+
+  // Save inline UTF-8 + duplicate auto-rename in project scope
+  const s1 = await postJson(baseUrl, '/api/files/save', {
+    scope: 'project',
+    workspaceUri,
+    filename: 'spec.md',
+    content: '# Spec 1',
+  });
+  assert.equal(s1.status, 200);
+  assert.equal(s1.data.savedFile.name, 'spec.md');
+
+  const s2 = await postJson(baseUrl, '/api/files/save', {
+    scope: 'project',
+    workspaceUri,
+    filename: 'spec.md',
+    content: '# Spec 2',
+  });
+  assert.equal(s2.status, 200);
+  assert.equal(s2.data.savedFile.name, 'spec-2.md');
+
+  // Save base64 binary in project scope
+  const pngHeader = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const sBin = await postJson(baseUrl, '/api/files/save', {
+    scope: 'project',
+    workspaceUri,
+    filename: 'logo.png',
+    content: pngHeader.toString('base64'),
+    encoding: 'base64',
+  });
+  assert.equal(sBin.status, 200);
+  assert.deepEqual(readFileSync(sBin.data.savedFile.path), pngHeader);
+
+  // List project files
+  const projList = await fetchJson(
+    baseUrl,
+    `/api/files?scope=project&workspaceUri=${encodeURIComponent(workspaceUri)}`,
+  );
+  assert.equal(projList.status, 200);
+  assert.equal(projList.data.scope, 'project');
+  assert.equal(projList.data.files.length, 3);
+  assert.equal(projList.data.settings.defaultEditor, 'system');
+
+  // Import by path into global
+  const imp = await postJson(baseUrl, '/api/files/import', {
+    scope: 'global',
+    sourcePath: externalFile,
+  });
+  assert.equal(imp.status, 200);
+  assert.equal(imp.data.savedFile.name, 'external.md');
+
+  // Settings + Open (default and override)
+  const setRes = await postJson(baseUrl, '/api/settings', { defaultEditor: 'subl' });
+  assert.equal(setRes.status, 200);
+  assert.equal(setRes.data.settings.defaultEditor, 'subl');
+
+  const openDefault = await postJson(baseUrl, '/api/files/open', {
+    scope: 'global',
+    filename: 'external.md',
+  });
+  assert.equal(openDefault.status, 200);
+  assert.equal(openedCalls.length, 1);
+  assert.equal(openedCalls[0].opts.editor, 'subl');
+
+  const openOverride = await postJson(baseUrl, '/api/files/open', {
+    scope: 'global',
+    filename: 'external.md',
+    editor: 'code',
+  });
+  assert.equal(openOverride.status, 200);
+  assert.equal(openedCalls.length, 2);
+  assert.equal(openedCalls[1].opts.editor, 'code');
+
+  const openCustom = await postJson(baseUrl, '/api/files/open', {
+    scope: 'global',
+    filename: 'external.md',
+    editor: 'custom',
+    customCommand: 'nvim -R',
+  });
+  assert.equal(openCustom.status, 200);
+  assert.equal(openedCalls.length, 3);
+  assert.equal(openedCalls[2].opts.editor, 'custom');
+  assert.equal(openedCalls[2].opts.customCommand, 'nvim -R');
+
+  // Rename + Delete
+  const ren = await postJson(baseUrl, '/api/files/rename', {
+    scope: 'global',
+    filename: 'external.md',
+    newFilename: 'renamed.md',
+  });
+  assert.equal(ren.status, 200);
+  assert.equal(ren.data.renamedFile.name, 'renamed.md');
+
+  const del = await postJson(baseUrl, '/api/files/delete', {
+    scope: 'global',
+    filename: 'renamed.md',
+  });
+  assert.equal(del.status, 200);
+  assert.equal(del.data.files.length, 0);
+
+  // Symlink escape inside managed directory is rejected with 400 and never invokes editorRunner
+  symlinkSync(outsideSecret, join(dataDir, 'files', 'global', 'escape.txt'));
+  const openEscape = await postJson(baseUrl, '/api/files/open', {
+    scope: 'global',
+    filename: 'escape.txt',
+  });
+  assert.equal(openEscape.status, 400);
+  assert.equal(openedCalls.length, 3);
+
+  // Error mappings: 400 traversal, 400 >10 MB decoded payload, 404 missing file/import, 413 >16 MB body
+  const bad = await postJson(baseUrl, '/api/files/save', {
+    scope: 'global',
+    filename: '../evil.md',
+    content: 'x',
+  });
+  assert.equal(bad.status, 400);
+
+  const tooBigDecoded = await postJson(baseUrl, '/api/files/save', {
+    scope: 'global',
+    filename: 'huge.txt',
+    content: 'a'.repeat(10 * 1024 * 1024 + 1),
+    encoding: 'utf8',
+  });
+  assert.equal(tooBigDecoded.status, 400);
+
+  const missingDelete = await postJson(baseUrl, '/api/files/delete', {
+    scope: 'global',
+    filename: 'nope.md',
+  });
+  assert.equal(missingDelete.status, 404);
+
+  const missingImport = await postJson(baseUrl, '/api/files/import', {
+    scope: 'global',
+    sourcePath: join(root, 'does-not-exist.md'),
+  });
+  assert.equal(missingImport.status, 404);
+
+  const oversizedBody = JSON.stringify({
+    scope: 'global',
+    filename: 'over16mb.txt',
+    content: 'x'.repeat(16 * 1024 * 1024 + 1024),
+  });
+  const overLimitRes = await fetchJson(baseUrl, '/api/files/save', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: oversizedBody,
+  });
+  assert.equal(overLimitRes.status, 413);
+  assert.ok(overLimitRes.data?.error);
+});
+
+test('SidecarApp mode supports file storage, editor open, settings routes, and error mapping', async (t) => {
+  const root = makeTempDir('agy-todo-files-sdk-');
+  const workspaceDir = join(root, 'sdk-files-proj');
+  const dataDir = join(root, 'data');
+  mkdirSync(workspaceDir, { recursive: true });
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  const externalFile = join(root, 'imported.md');
+  writeFileSync(externalFile, '# Imported via SDK\n', 'utf8');
+
+  const openedCalls = [];
+  const mockSdk = createMockSidecarSdk();
+  const handle = await startServer({
+    dataDir,
+    sidecarSdk: mockSdk,
+    forceSidecarSdk: true,
+    editorRunner: async (filePath, opts) => {
+      openedCalls.push({ filePath, opts });
+      return { ok: true, editor: opts.editor, command: 'mock', args: [filePath] };
+    },
+  });
+  t.after(() => handle.close());
+
+  assert.equal(handle.mode, 'sidecar_sdk');
+  const baseUrl = `http://127.0.0.1:${handle.port}`;
+  const workspaceUri = pathToFileURL(workspaceDir).href;
+
+  // Save in project scope
+  const saved = await postJson(baseUrl, '/api/files/save', {
+    scope: 'project',
+    workspaceUri,
+    filename: 'notes.md',
+    content: '# SDK Notes\n',
+  });
+  assert.equal(saved.status, 200);
+  assert.equal(saved.data.savedFile.name, 'notes.md');
+
+  // Import into global scope
+  const imp = await postJson(baseUrl, '/api/files/import', {
+    scope: 'global',
+    sourcePath: externalFile,
+  });
+  assert.equal(imp.status, 200);
+  assert.equal(imp.data.savedFile.name, 'imported.md');
+
+  // Update settings & list files
+  const setRes = await postJson(baseUrl, '/api/settings', {
+    defaultEditor: 'custom',
+    customEditorCommand: 'zed --wait',
+  });
+  assert.equal(setRes.status, 200);
+  assert.equal(setRes.data.settings.defaultEditor, 'custom');
+  assert.equal(setRes.data.settings.customEditorCommand, 'zed --wait');
+
+  const listRes = await fetchJson(
+    baseUrl,
+    `/api/files?scope=project&workspaceUri=${encodeURIComponent(workspaceUri)}`,
+  );
+  assert.equal(listRes.status, 200);
+  assert.equal(listRes.data.files.length, 1);
+  assert.equal(listRes.data.settings.defaultEditor, 'custom');
+  assert.equal(listRes.data.settings.customEditorCommand, 'zed --wait');
+
+  // Open using saved default custom editor
+  const openDefault = await postJson(baseUrl, '/api/files/open', {
+    scope: 'project',
+    workspaceUri,
+    filename: 'notes.md',
+  });
+  assert.equal(openDefault.status, 200);
+  assert.equal(openedCalls.length, 1);
+  assert.equal(openedCalls[0].opts.editor, 'custom');
+  assert.equal(openedCalls[0].opts.customCommand, 'zed --wait');
+
+  // Open with override editor
+  const openOverride = await postJson(baseUrl, '/api/files/open', {
+    scope: 'project',
+    workspaceUri,
+    filename: 'notes.md',
+    editor: 'agy',
+  });
+  assert.equal(openOverride.status, 200);
+  assert.equal(openedCalls.length, 2);
+  assert.equal(openedCalls[1].opts.editor, 'agy');
+
+  // Rename & delete
+  const ren = await postJson(baseUrl, '/api/files/rename', {
+    scope: 'project',
+    workspaceUri,
+    filename: 'notes.md',
+    newFilename: 'renamed-notes.md',
+  });
+  assert.equal(ren.status, 200);
+  assert.equal(ren.data.renamedFile.name, 'renamed-notes.md');
+
+  const del = await postJson(baseUrl, '/api/files/delete', {
+    scope: 'project',
+    workspaceUri,
+    filename: 'renamed-notes.md',
+  });
+  assert.equal(del.status, 200);
+  assert.equal(del.data.files.length, 0);
+
+  // Error mappings in SidecarApp mode
+  const bad = await postJson(baseUrl, '/api/files/save', {
+    scope: 'global',
+    filename: '../bad.md',
+    content: 'x',
+  });
+  assert.equal(bad.status, 400);
+
+  const missing = await postJson(baseUrl, '/api/files/open', {
+    scope: 'global',
+    filename: 'missing.md',
+  });
+  assert.equal(missing.status, 404);
 });

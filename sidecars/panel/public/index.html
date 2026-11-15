@@ -65,6 +65,71 @@
         <ul id="todos-list" class="todos-list"></ul>
       </section>
 
+      <section id="files-section" class="files-section" aria-label="Saved files">
+        <div class="section-header files-header">
+          <div class="section-title-group">
+            <h2 class="section-title">Files</h2>
+            <div class="scope-tabs" role="tablist" aria-label="File storage scope">
+              <button id="files-tab-project" class="scope-tab is-active" type="button" role="tab" aria-selected="true">Project</button>
+              <button id="files-tab-global" class="scope-tab" type="button" role="tab" aria-selected="false">Global</button>
+            </div>
+          </div>
+          <div class="files-toolbar">
+            <button id="file-new-btn" class="btn btn-ghost btn-xs" type="button" aria-expanded="false" aria-controls="file-new-form">+ New .md</button>
+            <button id="file-upload-btn" class="btn btn-ghost btn-xs" type="button">Upload</button>
+            <button id="file-path-btn" class="btn btn-ghost btn-xs" type="button" aria-expanded="false" aria-controls="file-path-form">From Path</button>
+            <button id="editor-settings-btn" class="btn btn-ghost btn-xs" type="button" aria-expanded="false" aria-controls="editor-settings-panel" title="External editor settings">Editor</button>
+          </div>
+          <input id="file-upload-input" type="file" multiple hidden>
+        </div>
+
+        <div id="editor-settings-panel" class="files-inline-form" hidden>
+          <div class="editor-settings-row">
+            <label class="editor-settings-label" for="editor-default-select">Default editor</label>
+            <select id="editor-default-select" class="editor-select" aria-label="Default external editor">
+              <option value="system">System Default</option>
+              <option value="subl">Sublime Text</option>
+              <option value="code">VS Code</option>
+              <option value="cursor">Cursor</option>
+              <option value="agy">Antigravity</option>
+              <option value="custom">Custom Command</option>
+            </select>
+          </div>
+          <form id="editor-custom-form" class="editor-custom-form" hidden>
+            <input id="editor-custom-input" class="input" type="text" placeholder="e.g. zed --wait" aria-label="Custom editor command" autocomplete="off">
+            <button id="editor-custom-save-btn" class="btn btn-primary btn-xs" type="submit">Save</button>
+          </form>
+          <span id="editor-settings-error" class="inline-error" role="alert" hidden></span>
+        </div>
+
+        <form id="file-new-form" class="files-inline-form" hidden>
+          <input id="file-new-name-input" class="input" type="text" placeholder="Filename (e.g. plan.md)" aria-label="New file name" autocomplete="off" required>
+          <textarea id="file-new-content-input" class="input file-new-textarea" rows="3" placeholder="Markdown content…" aria-label="New file content"></textarea>
+          <div class="link-form-actions">
+            <span id="file-new-error" class="inline-error" role="alert" hidden></span>
+            <div class="link-form-buttons">
+              <button id="file-new-cancel-btn" class="btn btn-ghost btn-xs" type="button">Cancel</button>
+              <button id="file-new-submit-btn" class="btn btn-primary btn-xs" type="submit">Save</button>
+            </div>
+          </div>
+        </form>
+
+        <form id="file-path-form" class="files-inline-form" hidden>
+          <input id="file-path-input" class="input" type="text" placeholder="/path/to/file or ~/notes.md" aria-label="Local file path to import" autocomplete="off" required>
+          <div class="link-form-actions">
+            <span id="file-path-error" class="inline-error" role="alert" hidden></span>
+            <div class="link-form-buttons">
+              <button id="file-path-cancel-btn" class="btn btn-ghost btn-xs" type="button">Cancel</button>
+              <button id="file-path-submit-btn" class="btn btn-primary btn-xs" type="submit">Import</button>
+            </div>
+          </div>
+        </form>
+
+        <div id="files-status" class="files-status" role="status" aria-live="polite" hidden></div>
+        <div id="files-drop-hint" class="files-drop-hint" hidden>Drop files here to save</div>
+        <ul id="files-list" class="files-list"></ul>
+      </section>
+
       <section id="notes-section" class="notes-section" aria-label="Notes">
         <div class="section-header">
           <h2 class="section-title">Notes</h2>

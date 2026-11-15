@@ -4,10 +4,21 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { NotFoundError, ValidationError, createStore } from './store.mjs';
+import { createFileStore } from './files-store.mjs';
+import { openFileInEditor } from './editor.mjs';
 
 const BIND_HOST = '127.0.0.1';
 const DEFAULT_STANDALONE_PORT = 4810;
+const MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
 const PUBLIC_DIR = join(dirname(fileURLToPath(import.meta.url)), 'public');
+
+class PayloadTooLargeError extends Error {
+  constructor(message = `Request body exceeds ${MAX_REQUEST_BODY_BYTES} byte limit`) {
+    super(message);
+    this.name = 'PayloadTooLargeError';
+    this.status = 413;
+  }
+}
 
 const STATIC_ROUTES = [
   { path: '/', file: 'index.html', contentType: 'text/html; charset=utf-8' },
@@ -91,7 +102,12 @@ function wrapApiHandler(ResponseCtor, handler) {
   };
 }
 
-function createApiRoutes(store, ResponseCtor) {
+export function createApiRoutes(
+  store,
+  ResponseCtor,
+  fileStore = createFileStore(),
+  editorRunner = openFileInEditor,
+) {
   const specs = [
     {
       method: 'GET',
@@ -138,6 +154,102 @@ function createApiRoutes(store, ResponseCtor) {
       path: '/api/links/delete',
       handler: (d) => store.deleteLink(d.workspaceUri, d.id),
     },
+    {
+      method: 'GET',
+      path: '/api/files',
+      handler: async (d) => {
+        const listing = await fileStore.listFiles(d.scope, d.workspaceUri);
+        const settings = await fileStore.getSettings();
+        return { ...listing, settings };
+      },
+    },
+    {
+      method: 'POST',
+      path: '/api/files/save',
+      handler: (d) =>
+        fileStore.saveFile({
+          scope: d.scope,
+          workspaceUri: d.workspaceUri,
+          filename: d.filename,
+          content: d.content,
+          encoding: d.encoding,
+        }),
+    },
+    {
+      method: 'POST',
+      path: '/api/files/import',
+      handler: (d) =>
+        fileStore.importFileFromPath({
+          scope: d.scope,
+          workspaceUri: d.workspaceUri,
+          sourcePath: d.sourcePath,
+        }),
+    },
+    {
+      method: 'POST',
+      path: '/api/files/rename',
+      handler: (d) =>
+        fileStore.renameFile({
+          scope: d.scope,
+          workspaceUri: d.workspaceUri,
+          filename: d.filename,
+          newFilename: d.newFilename,
+        }),
+    },
+    {
+      method: 'POST',
+      path: '/api/files/delete',
+      handler: (d) =>
+        fileStore.deleteFile({
+          scope: d.scope,
+          workspaceUri: d.workspaceUri,
+          filename: d.filename,
+        }),
+    },
+    {
+      method: 'POST',
+      path: '/api/files/open',
+      handler: async (d) => {
+        if (d.editor !== undefined && typeof d.editor !== 'string') {
+          throw new ValidationError('editor must be a string');
+        }
+        if (d.customCommand !== undefined && typeof d.customCommand !== 'string') {
+          throw new ValidationError('customCommand must be a string');
+        }
+
+        const filePath = await fileStore.resolveManagedFilePath({
+          scope: d.scope,
+          workspaceUri: d.workspaceUri,
+          filename: d.filename,
+        });
+
+        let editor = typeof d.editor === 'string' ? d.editor.trim() : '';
+        let customCommand = typeof d.customCommand === 'string' ? d.customCommand : '';
+
+        if (!editor || (editor === 'custom' && !customCommand)) {
+          const settings = await fileStore.getSettings();
+          if (!editor) {
+            editor = settings.defaultEditor;
+          }
+          if (!customCommand) {
+            customCommand = settings.customEditorCommand;
+          }
+        }
+
+        return editorRunner(filePath, { editor, customCommand });
+      },
+    },
+    {
+      method: 'POST',
+      path: '/api/settings',
+      handler: async (d) => {
+        const settings = await fileStore.saveSettings({
+          defaultEditor: d.defaultEditor,
+          customEditorCommand: d.customEditorCommand,
+        });
+        return { settings };
+      },
+    },
   ];
 
   return specs.map((spec) => ({
@@ -166,19 +278,59 @@ function hasSidecarEnv() {
   );
 }
 
-function readRequestBody(req) {
+function readRequestBody(req, maxBytes = MAX_REQUEST_BODY_BYTES) {
   return new Promise((resolveBody, rejectBody) => {
-    let body = '';
-    req.setEncoding('utf8');
-    req.on('data', (chunk) => {
-      body += chunk;
-    });
-    req.on('end', () => resolveBody(body));
-    req.on('error', rejectBody);
+    const chunks = [];
+    let totalBytes = 0;
+    let settled = false;
+
+    const cleanup = () => {
+      req.off('data', onData);
+      req.off('end', onEnd);
+      req.off('error', onError);
+    };
+
+    const onData = (chunk) => {
+      if (settled) return;
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8');
+      totalBytes += buf.length;
+      if (totalBytes > maxBytes) {
+        settled = true;
+        cleanup();
+        if (typeof req.resume === 'function') {
+          req.resume();
+        }
+        rejectBody(
+          new PayloadTooLargeError(
+            `Request body exceeds ${maxBytes} byte limit`,
+          ),
+        );
+        return;
+      }
+      chunks.push(buf);
+    };
+
+    const onEnd = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolveBody(Buffer.concat(chunks, totalBytes).toString('utf8'));
+    };
+
+    const onError = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      rejectBody(err);
+    };
+
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
   });
 }
 
-function startStandaloneServer(store, port) {
+function startStandaloneServer(store, port, fileStore, editorRunner) {
   const staticHandlers = new Map();
   for (const route of STATIC_ROUTES) {
     staticHandlers.set(route.path, () =>
@@ -195,7 +347,7 @@ function startStandaloneServer(store, port) {
   );
 
   const apiHandlers = new Map();
-  for (const route of createApiRoutes(store, null)) {
+  for (const route of createApiRoutes(store, null, fileStore, editorRunner)) {
     if (!apiHandlers.has(route.path)) {
       apiHandlers.set(route.path, new Map());
     }
@@ -230,7 +382,17 @@ function startStandaloneServer(store, port) {
           }
         }
 
-        const rawBody = await readRequestBody(req);
+        let rawBody;
+        try {
+          rawBody = await readRequestBody(req);
+        } catch (err) {
+          if (err instanceof PayloadTooLargeError) {
+            res.writeHead(413, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err.message }));
+            return;
+          }
+          throw err;
+        }
         if (rawBody.trim() !== '') {
           let parsed;
           try {
@@ -286,6 +448,8 @@ function startStandaloneServer(store, port) {
  */
 export async function startServer(options = {}) {
   const store = createStore({ dataDir: options.dataDir });
+  const fileStore = createFileStore({ dataDir: options.dataDir });
+  const editorRunner = options.editorRunner || openFileInEditor;
   const sidecarSdk = await loadSidecarSdk(options.sidecarSdk);
   const useSidecarSdk = Boolean(
     sidecarSdk?.SidecarApp && (options.forceSidecarSdk || hasSidecarEnv()),
@@ -306,7 +470,7 @@ export async function startServer(options = {}) {
       );
     }
 
-    for (const route of createApiRoutes(store, ResponseCtor)) {
+    for (const route of createApiRoutes(store, ResponseCtor, fileStore, editorRunner)) {
       app.api(route.path, route.handler, route.method);
     }
 
@@ -331,7 +495,7 @@ export async function startServer(options = {}) {
       ? Number(process.env.PORT)
       : DEFAULT_STANDALONE_PORT);
 
-  return startStandaloneServer(store, port);
+  return startStandaloneServer(store, port, fileStore, editorRunner);
 }
 
 function isDirectExecution() {

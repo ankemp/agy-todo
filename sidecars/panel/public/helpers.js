@@ -204,11 +204,106 @@
     return result;
   }
 
+  /**
+   * Formats a file path as an @path mention, quoting paths that contain whitespace.
+   * @param {unknown} filePath
+   * @returns {string}
+   */
+  function formatAttachMention(filePath) {
+    if (typeof filePath !== 'string') {
+      return '';
+    }
+    const trimmed = filePath.trim();
+    if (!trimmed) {
+      return '';
+    }
+    return /\s/.test(trimmed) ? `@"${trimmed}"` : `@${trimmed}`;
+  }
+
+  /**
+   * Formats a byte count into B, KB, or MB.
+   * @param {unknown} bytes
+   * @returns {string}
+   */
+  function formatFileSize(bytes) {
+    if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes <= 0) {
+      return '0 B';
+    }
+    if (bytes < 1024) {
+      return `${Math.floor(bytes)} B`;
+    }
+    if (bytes < 1024 * 1024) {
+      return `${(bytes / 1024).toFixed(1)} KB`;
+    }
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  /**
+   * Normalizes a new inline filename, defaulting to .md when no extension is present.
+   * @param {unknown} rawName
+   * @returns {string}
+   */
+  function normalizeNewMarkdownFilename(rawName) {
+    if (typeof rawName !== 'string') {
+      return '';
+    }
+    const trimmed = rawName.trim();
+    if (!trimmed) {
+      return '';
+    }
+    return trimmed.includes('.') ? trimmed : `${trimmed}.md`;
+  }
+
+  /**
+   * Encodes an ArrayBuffer or Uint8Array to base64 using chunked conversion
+   * so large files up to 10 MB do not overflow the JS call stack.
+   * @param {ArrayBuffer | ArrayBufferView} buffer
+   * @returns {string}
+   */
+  function arrayBufferToBase64(buffer) {
+    if (!buffer) {
+      return '';
+    }
+    let bytes;
+    if (buffer instanceof Uint8Array) {
+      bytes = buffer;
+    } else if (ArrayBuffer.isView(buffer)) {
+      bytes = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    } else if (
+      buffer instanceof ArrayBuffer ||
+      Object.prototype.toString.call(buffer) === '[object ArrayBuffer]'
+    ) {
+      bytes = new Uint8Array(buffer);
+    } else {
+      throw new TypeError('arrayBufferToBase64 requires an ArrayBuffer or TypedArray');
+    }
+
+    if (bytes.length === 0) {
+      return '';
+    }
+
+    const CHUNK_SIZE = 8192;
+    const chunks = [];
+    for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+      const slice = bytes.subarray(i, i + CHUNK_SIZE);
+      chunks.push(String.fromCharCode.apply(null, slice));
+    }
+    const binary = chunks.join('');
+    if (typeof btoa === 'function') {
+      return btoa(binary);
+    }
+    return Buffer.from(bytes).toString('base64');
+  }
+
   return {
     escapeHtml,
     partitionTodos,
     formatMarkdown,
     createNotesAutosaver,
     extractWorkspaceUrisFromMetadata,
+    formatAttachMention,
+    formatFileSize,
+    normalizeNewMarkdownFilename,
+    arrayBufferToBase64,
   };
 });

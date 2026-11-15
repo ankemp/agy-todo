@@ -20,6 +20,10 @@ const {
   formatMarkdown,
   createNotesAutosaver,
   extractWorkspaceUrisFromMetadata,
+  formatAttachMention,
+  formatFileSize,
+  normalizeNewMarkdownFilename,
+  arrayBufferToBase64,
 } = loadHelpers(helpersTarget, helpersTarget);
 
 test('escapeHtml neutralizes HTML tags and attribute quotes', () => {
@@ -192,4 +196,99 @@ test('extractWorkspaceUrisFromMetadata extracts and deduplicates workspace URIs'
   );
 
   assert.deepEqual(extractWorkspaceUrisFromMetadata(null), []);
+});
+
+test('formatAttachMention formats @path mentions and quotes paths containing whitespace', () => {
+  assert.equal(formatAttachMention('/tmp/data/plan.md'), '@/tmp/data/plan.md');
+  assert.equal(
+    formatAttachMention('/Users/my user/data/plan.md'),
+    '@"/Users/my user/data/plan.md"',
+  );
+  assert.equal(formatAttachMention(''), '');
+  assert.equal(formatAttachMention('   '), '');
+  assert.equal(formatAttachMention(null), '');
+});
+
+test('formatFileSize formats bytes, KB, and MB cleanly', () => {
+  assert.equal(formatFileSize(0), '0 B');
+  assert.equal(formatFileSize(512), '512 B');
+  assert.equal(formatFileSize(1536), '1.5 KB');
+  assert.equal(formatFileSize(2 * 1024 * 1024), '2.0 MB');
+  assert.equal(formatFileSize(-1), '0 B');
+  assert.equal(formatFileSize(NaN), '0 B');
+});
+
+test('normalizeNewMarkdownFilename defaults to .md when no extension is given', () => {
+  assert.equal(normalizeNewMarkdownFilename('notes'), 'notes.md');
+  assert.equal(normalizeNewMarkdownFilename('  notes  '), 'notes.md');
+  assert.equal(normalizeNewMarkdownFilename('spec.md'), 'spec.md');
+  assert.equal(normalizeNewMarkdownFilename('config.json'), 'config.json');
+  assert.equal(normalizeNewMarkdownFilename('.gitignore'), '.gitignore');
+  assert.equal(normalizeNewMarkdownFilename('   '), '');
+  assert.equal(normalizeNewMarkdownFilename(null), '');
+});
+
+test('arrayBufferToBase64 encodes arbitrary binary bytes and chunked buffers accurately', () => {
+  const bytes = new Uint8Array([0x00, 0x01, 0x89, 0x50, 0x4e, 0x47, 0xff]);
+  assert.equal(
+    arrayBufferToBase64(bytes.buffer),
+    Buffer.from(bytes).toString('base64'),
+  );
+  assert.equal(
+    arrayBufferToBase64(bytes),
+    Buffer.from(bytes).toString('base64'),
+  );
+
+  // Verify chunking across > 8192-byte buffers without call stack overflow
+  const large = new Uint8Array(25000);
+  for (let i = 0; i < large.length; i += 1) {
+    large[i] = (i * 31) & 0xff;
+  }
+  assert.equal(
+    arrayBufferToBase64(large.buffer),
+    Buffer.from(large).toString('base64'),
+  );
+  assert.equal(arrayBufferToBase64(new ArrayBuffer(0)), '');
+});
+
+test('public/index.html includes #files-section above #notes-section with Project and Global tabs and controls', () => {
+  const html = readFileSync(join(publicDir, 'index.html'), 'utf8');
+  const todosIdx = html.indexOf('id="todos-section"');
+  const filesIdx = html.indexOf('id="files-section"');
+  const notesIdx = html.indexOf('id="notes-section"');
+
+  assert.ok(todosIdx !== -1 && filesIdx !== -1 && notesIdx !== -1);
+  assert.ok(todosIdx < filesIdx && filesIdx < notesIdx, 'Files section must sit between Todos and Notes');
+
+  assert.match(html, /id="files-tab-project"[^>]*role="tab"[^>]*aria-selected="/);
+  assert.match(html, /id="files-tab-global"[^>]*role="tab"[^>]*aria-selected="/);
+  assert.match(html, /id="file-upload-input"[^>]*type="file"[^>]*multiple/);
+  assert.match(html, /id="file-new-form"/);
+  assert.match(html, /id="file-path-form"/);
+  assert.match(html, /id="editor-default-select"/);
+  assert.match(html, /id="editor-custom-form"/);
+  assert.match(html, /id="files-list"/);
+});
+
+test('public/app.js is valid classic JS, avoids raw HTML sinks, and wires all file API routes', () => {
+  const appJs = readFileSync(join(publicDir, 'app.js'), 'utf8');
+
+  // Must parse cleanly as classic script without ESM syntax
+  assert.doesNotThrow(() => new vm.Script(appJs, { filename: 'public/app.js' }));
+
+  // Must avoid unsafe HTML injection sinks
+  assert.doesNotMatch(appJs, /\binnerHTML\b|\bouterHTML\b|\binsertAdjacentHTML\b|document\.write\b/);
+
+  // Must integrate all files and settings routes
+  for (const route of [
+    '/api/files?',
+    '/api/files/save',
+    '/api/files/import',
+    '/api/files/rename',
+    '/api/files/delete',
+    '/api/files/open',
+    '/api/settings',
+  ]) {
+    assert.ok(appJs.includes(route), `Expected app.js to reference ${route}`);
+  }
 });

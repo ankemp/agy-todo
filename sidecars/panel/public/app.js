@@ -6,7 +6,20 @@ const {
   formatMarkdown,
   createNotesAutosaver,
   extractWorkspaceUrisFromMetadata,
+  formatAttachMention,
+  formatFileSize,
+  normalizeNewMarkdownFilename,
+  arrayBufferToBase64,
 } = window.AGYTodoHelpers;
+
+const MAX_FILE_BYTES = 10 * 1024 * 1024;
+const OPEN_WITH_EDITORS = [
+  { id: 'subl', label: 'Sublime Text' },
+  { id: 'code', label: 'VS Code' },
+  { id: 'cursor', label: 'Cursor' },
+  { id: 'agy', label: 'Antigravity' },
+  { id: 'system', label: 'System Default' },
+];
 
 const emptyStateEl = document.getElementById('empty-state');
 const appShellEl = document.getElementById('app-shell');
@@ -30,6 +43,32 @@ const todoAddFormEl = document.getElementById('todo-add-form');
 const todoInputEl = document.getElementById('todo-input');
 const todosListEl = document.getElementById('todos-list');
 
+const filesSectionEl = document.getElementById('files-section');
+const filesTabProjectEl = document.getElementById('files-tab-project');
+const filesTabGlobalEl = document.getElementById('files-tab-global');
+const fileNewBtnEl = document.getElementById('file-new-btn');
+const fileUploadBtnEl = document.getElementById('file-upload-btn');
+const filePathBtnEl = document.getElementById('file-path-btn');
+const editorSettingsBtnEl = document.getElementById('editor-settings-btn');
+const fileUploadInputEl = document.getElementById('file-upload-input');
+const editorSettingsPanelEl = document.getElementById('editor-settings-panel');
+const editorDefaultSelectEl = document.getElementById('editor-default-select');
+const editorCustomFormEl = document.getElementById('editor-custom-form');
+const editorCustomInputEl = document.getElementById('editor-custom-input');
+const editorSettingsErrorEl = document.getElementById('editor-settings-error');
+const fileNewFormEl = document.getElementById('file-new-form');
+const fileNewNameInputEl = document.getElementById('file-new-name-input');
+const fileNewContentInputEl = document.getElementById('file-new-content-input');
+const fileNewErrorEl = document.getElementById('file-new-error');
+const fileNewCancelBtnEl = document.getElementById('file-new-cancel-btn');
+const filePathFormEl = document.getElementById('file-path-form');
+const filePathInputEl = document.getElementById('file-path-input');
+const filePathErrorEl = document.getElementById('file-path-error');
+const filePathCancelBtnEl = document.getElementById('file-path-cancel-btn');
+const filesStatusEl = document.getElementById('files-status');
+const filesDropHintEl = document.getElementById('files-drop-hint');
+const filesListEl = document.getElementById('files-list');
+
 const notesInputEl = document.getElementById('notes-input');
 
 let workspaceUris = [];
@@ -39,6 +78,15 @@ let editingTodoId = null;
 let loadSeq = 0;
 let workspaceQueue = Promise.resolve();
 let exportResetTimer = null;
+
+let activeFilesScope = 'project';
+let filesList = [];
+let editorSettings = { defaultEditor: 'system', customEditorCommand: '' };
+let editingFileName = null;
+let openMenuForFile = null;
+let filesLoadSeq = 0;
+let filesStatusTimer = null;
+let dragDepth = 0;
 
 function setStatus(state, text) {
   saveStatusEl.textContent = text;
@@ -303,11 +351,312 @@ function renderNotes() {
   }
 }
 
+function showFilesStatus(message, isError = false, autoHideMs = 3000) {
+  if (filesStatusTimer) {
+    clearTimeout(filesStatusTimer);
+    filesStatusTimer = null;
+  }
+  filesStatusEl.textContent = message || '';
+  filesStatusEl.classList.toggle('is-error', Boolean(isError));
+  filesStatusEl.hidden = !message;
+  if (message && autoHideMs > 0) {
+    filesStatusTimer = setTimeout(() => {
+      filesStatusEl.hidden = true;
+      filesStatusEl.textContent = '';
+      filesStatusTimer = null;
+    }, autoHideMs);
+  }
+}
+
+function fileScopePayload(scope = activeFilesScope, workspaceUri = activeWorkspaceUri) {
+  if (scope === 'project') {
+    return { scope: 'project', workspaceUri };
+  }
+  return { scope: 'global' };
+}
+
+async function copyTextToClipboard(text) {
+  if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
+    return false;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function flashButtonLabel(button, temporaryLabel, defaultLabel) {
+  button.textContent = temporaryLabel;
+  setTimeout(() => {
+    if (button.isConnected) {
+      button.textContent = defaultLabel;
+    }
+  }, 1500);
+}
+
+function positionOpenWithMenu(menuEl, anchorEl) {
+  const rect = anchorEl.getBoundingClientRect();
+  if (!rect || (rect.width === 0 && rect.height === 0)) {
+    return;
+  }
+  const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 360;
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 600;
+  const menuHeight = menuEl.offsetHeight || 150;
+  const rightOffset = Math.max(8, viewportWidth - rect.right);
+
+  menuEl.style.right = `${rightOffset}px`;
+  if (rect.bottom + menuHeight + 8 <= viewportHeight) {
+    menuEl.style.top = `${rect.bottom + 2}px`;
+    menuEl.style.bottom = 'auto';
+  } else {
+    menuEl.style.bottom = `${Math.max(8, viewportHeight - rect.top + 2)}px`;
+    menuEl.style.top = 'auto';
+  }
+}
+
+function renderFilesTabs() {
+  const isProject = activeFilesScope === 'project';
+  filesTabProjectEl.classList.toggle('is-active', isProject);
+  filesTabProjectEl.setAttribute('aria-selected', isProject ? 'true' : 'false');
+  filesTabGlobalEl.classList.toggle('is-active', !isProject);
+  filesTabGlobalEl.setAttribute('aria-selected', isProject ? 'false' : 'true');
+}
+
+function renderEditorSettings() {
+  const chosen = editorSettings?.defaultEditor || 'system';
+  editorDefaultSelectEl.value = chosen;
+  const isCustom = chosen === 'custom';
+  editorCustomFormEl.hidden = !isCustom;
+  if (isCustom && document.activeElement !== editorCustomInputEl) {
+    editorCustomInputEl.value = editorSettings?.customEditorCommand || '';
+  }
+}
+
+function renderFiles() {
+  renderFilesTabs();
+  while (filesListEl.firstChild) {
+    filesListEl.removeChild(filesListEl.firstChild);
+  }
+
+  if (!Array.isArray(filesList) || filesList.length === 0) {
+    const emptyLi = document.createElement('li');
+    emptyLi.className = 'files-empty';
+    emptyLi.textContent =
+      activeFilesScope === 'project'
+        ? 'No project files yet. Drop files here or create one.'
+        : 'No global files yet. Drop files here or create one.';
+    filesListEl.appendChild(emptyLi);
+    return;
+  }
+
+  for (const file of filesList) {
+    const li = document.createElement('li');
+    li.className = 'file-row';
+
+    if (editingFileName === file.name) {
+      const editInput = document.createElement('input');
+      editInput.type = 'text';
+      editInput.className = 'input file-edit-input';
+      editInput.value = file.name;
+      editInput.setAttribute('aria-label', `Rename ${file.name}`);
+
+      let finished = false;
+      const commitRename = async () => {
+        if (finished) return;
+        finished = true;
+        const nextName = editInput.value.trim();
+        editingFileName = null;
+        if (!nextName || nextName === file.name) {
+          renderFiles();
+          return;
+        }
+        await handleRenameFile(file.name, nextName);
+      };
+      const cancelRename = () => {
+        if (finished) return;
+        finished = true;
+        editingFileName = null;
+        renderFiles();
+      };
+
+      editInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          void commitRename();
+        } else if (event.key === 'Escape') {
+          event.preventDefault();
+          cancelRename();
+        }
+      });
+      editInput.addEventListener('blur', () => {
+        void commitRename();
+      });
+
+      li.appendChild(editInput);
+      filesListEl.appendChild(li);
+      queueMicrotask(() => {
+        editInput.focus();
+        editInput.select();
+      });
+      continue;
+    }
+
+    const mainDiv = document.createElement('div');
+    mainDiv.className = 'file-main';
+
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'file-name';
+    nameSpan.textContent = file.name;
+    nameSpan.title = `${file.path} (double-click to rename)`;
+    nameSpan.addEventListener('dblclick', () => {
+      openMenuForFile = null;
+      editingFileName = file.name;
+      renderFiles();
+    });
+    mainDiv.appendChild(nameSpan);
+
+    const sizeSpan = document.createElement('span');
+    sizeSpan.className = 'file-size';
+    sizeSpan.textContent = formatFileSize(file.size);
+    mainDiv.appendChild(sizeSpan);
+
+    const renameBtn = document.createElement('button');
+    renameBtn.type = 'button';
+    renameBtn.className = 'file-rename-btn';
+    renameBtn.title = 'Rename file';
+    renameBtn.setAttribute('aria-label', `Rename ${file.name}`);
+    renameBtn.textContent = '✎';
+    renameBtn.addEventListener('click', () => {
+      openMenuForFile = null;
+      editingFileName = file.name;
+      renderFiles();
+    });
+    mainDiv.appendChild(renameBtn);
+
+    li.appendChild(mainDiv);
+
+    const actionsDiv = document.createElement('div');
+    actionsDiv.className = 'file-actions';
+
+    const attachBtn = document.createElement('button');
+    attachBtn.type = 'button';
+    attachBtn.className = 'btn btn-xs file-action-btn';
+    attachBtn.title = 'Copy @path mention for chat';
+    attachBtn.setAttribute('aria-label', `Attach ${file.name}`);
+    attachBtn.textContent = 'Attach';
+    attachBtn.addEventListener('click', async () => {
+      const mention = formatAttachMention(file.path);
+      const copied = await copyTextToClipboard(mention);
+      if (copied) {
+        flashButtonLabel(attachBtn, 'Copied @', 'Attach');
+      } else {
+        showFilesStatus(`Clipboard unavailable. Copy manually: ${mention}`, true, 6000);
+      }
+    });
+    actionsDiv.appendChild(attachBtn);
+
+    const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.className = 'btn btn-xs file-action-btn';
+    copyBtn.title = 'Copy file path';
+    copyBtn.setAttribute('aria-label', `Copy path for ${file.name}`);
+    copyBtn.textContent = 'Copy';
+    copyBtn.addEventListener('click', async () => {
+      const copied = await copyTextToClipboard(file.path);
+      if (copied) {
+        flashButtonLabel(copyBtn, 'Copied!', 'Copy');
+      } else {
+        showFilesStatus(`Clipboard unavailable. Path: ${file.path}`, true, 6000);
+      }
+    });
+    actionsDiv.appendChild(copyBtn);
+
+    const openSplit = document.createElement('div');
+    openSplit.className = 'open-split';
+
+    const openBtn = document.createElement('button');
+    openBtn.type = 'button';
+    openBtn.className = 'btn btn-xs file-action-btn open-split-main';
+    openBtn.title = 'Open in default editor';
+    openBtn.setAttribute('aria-label', `Open ${file.name}`);
+    openBtn.textContent = 'Open';
+    openBtn.addEventListener('click', () => {
+      openMenuForFile = null;
+      void handleOpenFile(file.name);
+    });
+    openSplit.appendChild(openBtn);
+
+    const openToggleBtn = document.createElement('button');
+    openToggleBtn.type = 'button';
+    openToggleBtn.className = 'btn btn-xs file-action-btn open-split-toggle';
+    openToggleBtn.title = 'Open with…';
+    openToggleBtn.setAttribute('aria-label', `Open ${file.name} with specific editor`);
+    openToggleBtn.setAttribute('aria-haspopup', 'menu');
+    openToggleBtn.setAttribute('aria-expanded', openMenuForFile === file.name ? 'true' : 'false');
+    openToggleBtn.textContent = '▾';
+    openToggleBtn.addEventListener('click', (event) => {
+      event.stopPropagation();
+      openMenuForFile = openMenuForFile === file.name ? null : file.name;
+      renderFiles();
+    });
+    openSplit.appendChild(openToggleBtn);
+
+    if (openMenuForFile === file.name) {
+      const menu = document.createElement('div');
+      menu.className = 'open-with-menu';
+      menu.setAttribute('role', 'menu');
+
+      for (const opt of OPEN_WITH_EDITORS) {
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'open-with-item';
+        item.setAttribute('role', 'menuitem');
+        item.textContent = opt.label;
+        item.addEventListener('click', (event) => {
+          event.stopPropagation();
+          openMenuForFile = null;
+          renderFiles();
+          void handleOpenFile(file.name, opt.id);
+        });
+        menu.appendChild(item);
+      }
+
+      openSplit.appendChild(menu);
+      queueMicrotask(() => {
+        if (menu.isConnected && openToggleBtn.isConnected) {
+          positionOpenWithMenu(menu, openToggleBtn);
+        }
+      });
+    }
+
+    actionsDiv.appendChild(openSplit);
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.type = 'button';
+    deleteBtn.className = 'file-delete-btn';
+    deleteBtn.title = 'Delete file';
+    deleteBtn.setAttribute('aria-label', `Delete file ${file.name}`);
+    deleteBtn.textContent = '×';
+    deleteBtn.addEventListener('click', () => {
+      openMenuForFile = null;
+      void handleDeleteFile(file.name);
+    });
+    actionsDiv.appendChild(deleteBtn);
+
+    li.appendChild(actionsDiv);
+    filesListEl.appendChild(li);
+  }
+}
+
 function renderAll() {
   renderHeader();
   renderWorkspaceSelector();
   renderLinks();
   renderTodos();
+  renderFiles();
+  renderEditorSettings();
   renderNotes();
 }
 
@@ -326,6 +675,235 @@ function openLinkForm() {
   linkErrorEl.textContent = '';
   linkErrorEl.hidden = true;
   linkLabelInputEl.focus();
+}
+
+function closeNewFileForm() {
+  fileNewFormEl.hidden = true;
+  fileNewBtnEl.setAttribute('aria-expanded', 'false');
+  fileNewNameInputEl.value = '';
+  fileNewContentInputEl.value = '';
+  fileNewErrorEl.textContent = '';
+  fileNewErrorEl.hidden = true;
+}
+
+function openNewFileForm() {
+  closePathImportForm();
+  closeEditorSettingsPanel();
+  fileNewFormEl.hidden = false;
+  fileNewBtnEl.setAttribute('aria-expanded', 'true');
+  fileNewErrorEl.textContent = '';
+  fileNewErrorEl.hidden = true;
+  fileNewNameInputEl.focus();
+}
+
+function closePathImportForm() {
+  filePathFormEl.hidden = true;
+  filePathBtnEl.setAttribute('aria-expanded', 'false');
+  filePathInputEl.value = '';
+  filePathErrorEl.textContent = '';
+  filePathErrorEl.hidden = true;
+}
+
+function openPathImportForm() {
+  closeNewFileForm();
+  closeEditorSettingsPanel();
+  filePathFormEl.hidden = false;
+  filePathBtnEl.setAttribute('aria-expanded', 'true');
+  filePathErrorEl.textContent = '';
+  filePathErrorEl.hidden = true;
+  filePathInputEl.focus();
+}
+
+function closeEditorSettingsPanel() {
+  editorSettingsPanelEl.hidden = true;
+  editorSettingsBtnEl.setAttribute('aria-expanded', 'false');
+  editorSettingsErrorEl.textContent = '';
+  editorSettingsErrorEl.hidden = true;
+}
+
+function openEditorSettingsPanel() {
+  closeNewFileForm();
+  closePathImportForm();
+  renderEditorSettings();
+  editorSettingsPanelEl.hidden = false;
+  editorSettingsBtnEl.setAttribute('aria-expanded', 'true');
+  editorSettingsErrorEl.textContent = '';
+  editorSettingsErrorEl.hidden = true;
+}
+
+function closeAllFilePanels() {
+  closeNewFileForm();
+  closePathImportForm();
+  closeEditorSettingsPanel();
+}
+
+async function loadFiles(scope = activeFilesScope, workspaceUri = activeWorkspaceUri) {
+  if (scope === 'project' && !workspaceUri) {
+    filesList = [];
+    renderFiles();
+    return;
+  }
+
+  const seq = ++filesLoadSeq;
+  const params = new URLSearchParams({ scope });
+  if (scope === 'project' && workspaceUri) {
+    params.set('workspaceUri', workspaceUri);
+  }
+
+  try {
+    const data = await sidecarRequest(`/api/files?${params.toString()}`);
+    if (seq !== filesLoadSeq || scope !== activeFilesScope) return;
+    if (scope === 'project' && workspaceUri !== activeWorkspaceUri) return;
+
+    filesList = Array.isArray(data?.files) ? data.files : [];
+    if (data?.settings && typeof data.settings === 'object') {
+      editorSettings = {
+        defaultEditor: data.settings.defaultEditor || 'system',
+        customEditorCommand: data.settings.customEditorCommand || '',
+      };
+      renderEditorSettings();
+    }
+    renderFiles();
+  } catch (err) {
+    if (seq !== filesLoadSeq || scope !== activeFilesScope) return;
+    console.error('Failed to load files:', err);
+    showFilesStatus(err.message || 'Failed to load files', true, 0);
+  }
+}
+
+async function handleRenameFile(filename, newFilename) {
+  const targetScope = activeFilesScope;
+  const targetUri = activeWorkspaceUri;
+  if (targetScope === 'project' && !targetUri) return;
+
+  try {
+    const res = await postJson('/api/files/rename', {
+      ...fileScopePayload(targetScope, targetUri),
+      filename,
+      newFilename,
+    });
+    if (targetScope !== activeFilesScope) return;
+    if (targetScope === 'project' && targetUri !== activeWorkspaceUri) return;
+    filesList = Array.isArray(res?.files) ? res.files : filesList;
+    renderFiles();
+  } catch (err) {
+    console.error('Failed to rename file:', err);
+    showFilesStatus(err.message || 'Failed to rename file', true, 5000);
+    renderFiles();
+  }
+}
+
+async function handleDeleteFile(filename) {
+  const targetScope = activeFilesScope;
+  const targetUri = activeWorkspaceUri;
+  if (targetScope === 'project' && !targetUri) return;
+
+  try {
+    const res = await postJson('/api/files/delete', {
+      ...fileScopePayload(targetScope, targetUri),
+      filename,
+    });
+    if (targetScope !== activeFilesScope) return;
+    if (targetScope === 'project' && targetUri !== activeWorkspaceUri) return;
+    filesList = Array.isArray(res?.files) ? res.files : [];
+    renderFiles();
+  } catch (err) {
+    console.error('Failed to delete file:', err);
+    showFilesStatus(err.message || 'Failed to delete file', true, 5000);
+  }
+}
+
+async function handleOpenFile(filename, editorOverride) {
+  const targetScope = activeFilesScope;
+  const targetUri = activeWorkspaceUri;
+  if (targetScope === 'project' && !targetUri) return;
+
+  const payload = {
+    ...fileScopePayload(targetScope, targetUri),
+    filename,
+  };
+  if (editorOverride) {
+    payload.editor = editorOverride;
+  }
+
+  try {
+    await postJson('/api/files/open', payload);
+  } catch (err) {
+    console.error('Failed to open file:', err);
+    showFilesStatus(err.message || 'Failed to open file in editor', true, 5000);
+  }
+}
+
+async function handleUploadFiles(fileList) {
+  const files = Array.from(fileList || []);
+  if (files.length === 0) return;
+
+  const targetScope = activeFilesScope;
+  const targetUri = activeWorkspaceUri;
+  if (targetScope === 'project' && !targetUri) {
+    showFilesStatus('Open a workspace before uploading project files.', true, 4000);
+    return;
+  }
+
+  const errors = [];
+  let savedCount = 0;
+
+  for (const file of files) {
+    if (file.size > MAX_FILE_BYTES) {
+      errors.push(`"${file.name}" exceeds 10 MB limit`);
+      continue;
+    }
+
+    try {
+      const buffer = await file.arrayBuffer();
+      const content = arrayBufferToBase64(buffer);
+      const res = await postJson('/api/files/save', {
+        ...fileScopePayload(targetScope, targetUri),
+        filename: file.name,
+        content,
+        encoding: 'base64',
+      });
+      savedCount += 1;
+      if (
+        targetScope === activeFilesScope &&
+        (targetScope !== 'project' || targetUri === activeWorkspaceUri)
+      ) {
+        filesList = Array.isArray(res?.files) ? res.files : filesList;
+        renderFiles();
+      }
+    } catch (err) {
+      errors.push(`"${file.name}": ${err.message || 'upload failed'}`);
+    }
+  }
+
+  if (errors.length > 0) {
+    showFilesStatus(errors.join('; '), true, 6000);
+  } else if (savedCount > 0) {
+    showFilesStatus(savedCount === 1 ? 'File saved' : `${savedCount} files saved`, false, 2000);
+  }
+}
+
+async function saveEditorSettings(defaultEditor, customEditorCommand) {
+  editorSettingsErrorEl.hidden = true;
+  editorSettingsErrorEl.textContent = '';
+
+  try {
+    const res = await postJson('/api/settings', {
+      defaultEditor,
+      customEditorCommand,
+    });
+    if (res?.settings) {
+      editorSettings = {
+        defaultEditor: res.settings.defaultEditor || 'system',
+        customEditorCommand: res.settings.customEditorCommand || '',
+      };
+    }
+    renderEditorSettings();
+    showFilesStatus('Editor preference saved', false, 2000);
+  } catch (err) {
+    editorSettingsErrorEl.textContent = err.message || 'Failed to save editor setting';
+    editorSettingsErrorEl.hidden = false;
+  }
 }
 
 async function applyMutation(fn) {
@@ -389,16 +967,24 @@ async function switchWorkspace(nextUri) {
   activeWorkspaceUri = nextUri;
   scratchpad = null;
   editingTodoId = null;
+  editingFileName = null;
+  openMenuForFile = null;
+  filesList = [];
   notesInputEl.value = '';
   notesInputEl.disabled = true;
   closeLinkForm();
+  closeAllFilePanels();
+  showFilesStatus('');
   emptyStateEl.hidden = true;
   appShellEl.hidden = false;
   renderHeader();
   renderWorkspaceSelector();
   renderLinks();
   renderTodos();
+  renderFiles();
   setStatus('saving', 'Loading…');
+
+  const filesPromise = loadFiles(activeFilesScope, nextUri);
 
   try {
     const data = await sidecarRequest(
@@ -414,6 +1000,8 @@ async function switchWorkspace(nextUri) {
     console.error('Failed to load scratchpad:', err);
     setStatus('error', 'Load failed');
   }
+
+  await filesPromise;
 }
 
 function enqueueWorkspaceUris(rawUris) {
@@ -428,10 +1016,16 @@ function enqueueWorkspaceUris(rawUris) {
           console.error('Failed to flush notes before clearing workspace:', err);
         });
         loadSeq++;
+        filesLoadSeq++;
         activeWorkspaceUri = null;
         scratchpad = null;
         editingTodoId = null;
+        editingFileName = null;
+        openMenuForFile = null;
+        filesList = [];
         closeLinkForm();
+        closeAllFilePanels();
+        showFilesStatus('');
         appShellEl.hidden = true;
         emptyStateEl.hidden = false;
         return;
@@ -525,6 +1119,255 @@ clearDoneBtnEl.addEventListener('click', async () => {
     );
   } catch (err) {
     console.error('Failed to clear completed todos:', err);
+  }
+});
+
+filesTabProjectEl.addEventListener('click', () => {
+  if (activeFilesScope === 'project') return;
+  activeFilesScope = 'project';
+  editingFileName = null;
+  openMenuForFile = null;
+  filesList = [];
+  showFilesStatus('');
+  renderFiles();
+  void loadFiles('project', activeWorkspaceUri);
+});
+
+filesTabGlobalEl.addEventListener('click', () => {
+  if (activeFilesScope === 'global') return;
+  activeFilesScope = 'global';
+  editingFileName = null;
+  openMenuForFile = null;
+  filesList = [];
+  showFilesStatus('');
+  renderFiles();
+  void loadFiles('global', activeWorkspaceUri);
+});
+
+fileNewBtnEl.addEventListener('click', () => {
+  if (fileNewFormEl.hidden) {
+    openNewFileForm();
+  } else {
+    closeNewFileForm();
+  }
+});
+
+fileNewCancelBtnEl.addEventListener('click', () => {
+  closeNewFileForm();
+});
+
+fileNewFormEl.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    closeNewFileForm();
+  }
+});
+
+fileNewFormEl.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const targetScope = activeFilesScope;
+  const targetUri = activeWorkspaceUri;
+  if (targetScope === 'project' && !targetUri) return;
+
+  const filename = normalizeNewMarkdownFilename(fileNewNameInputEl.value);
+  if (!filename) {
+    fileNewErrorEl.textContent = 'Filename is required';
+    fileNewErrorEl.hidden = false;
+    return;
+  }
+
+  const content = fileNewContentInputEl.value || '';
+  fileNewErrorEl.hidden = true;
+  fileNewErrorEl.textContent = '';
+
+  try {
+    const res = await postJson('/api/files/save', {
+      ...fileScopePayload(targetScope, targetUri),
+      filename,
+      content,
+      encoding: 'utf8',
+    });
+    if (
+      targetScope === activeFilesScope &&
+      (targetScope !== 'project' || targetUri === activeWorkspaceUri)
+    ) {
+      filesList = Array.isArray(res?.files) ? res.files : filesList;
+      renderFiles();
+    }
+    closeNewFileForm();
+  } catch (err) {
+    fileNewErrorEl.textContent = err.message || 'Failed to save file';
+    fileNewErrorEl.hidden = false;
+  }
+});
+
+fileUploadBtnEl.addEventListener('click', () => {
+  fileUploadInputEl.click();
+});
+
+fileUploadInputEl.addEventListener('change', async () => {
+  const files = fileUploadInputEl.files;
+  await handleUploadFiles(files);
+  fileUploadInputEl.value = '';
+});
+
+filePathBtnEl.addEventListener('click', () => {
+  if (filePathFormEl.hidden) {
+    openPathImportForm();
+  } else {
+    closePathImportForm();
+  }
+});
+
+filePathCancelBtnEl.addEventListener('click', () => {
+  closePathImportForm();
+});
+
+filePathFormEl.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    closePathImportForm();
+  }
+});
+
+filePathFormEl.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const targetScope = activeFilesScope;
+  const targetUri = activeWorkspaceUri;
+  if (targetScope === 'project' && !targetUri) return;
+
+  const sourcePath = filePathInputEl.value.trim();
+  if (!sourcePath) {
+    filePathErrorEl.textContent = 'Source file path is required';
+    filePathErrorEl.hidden = false;
+    return;
+  }
+
+  filePathErrorEl.hidden = true;
+  filePathErrorEl.textContent = '';
+
+  try {
+    const res = await postJson('/api/files/import', {
+      ...fileScopePayload(targetScope, targetUri),
+      sourcePath,
+    });
+    if (
+      targetScope === activeFilesScope &&
+      (targetScope !== 'project' || targetUri === activeWorkspaceUri)
+    ) {
+      filesList = Array.isArray(res?.files) ? res.files : filesList;
+      renderFiles();
+    }
+    closePathImportForm();
+  } catch (err) {
+    filePathErrorEl.textContent = err.message || 'Failed to import file';
+    filePathErrorEl.hidden = false;
+  }
+});
+
+editorSettingsBtnEl.addEventListener('click', () => {
+  if (editorSettingsPanelEl.hidden) {
+    openEditorSettingsPanel();
+  } else {
+    closeEditorSettingsPanel();
+  }
+});
+
+editorSettingsPanelEl.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    closeEditorSettingsPanel();
+  }
+});
+
+editorDefaultSelectEl.addEventListener('change', () => {
+  const chosen = editorDefaultSelectEl.value;
+  editorSettingsErrorEl.hidden = true;
+  editorSettingsErrorEl.textContent = '';
+
+  if (chosen === 'custom') {
+    editorCustomFormEl.hidden = false;
+    editorCustomInputEl.value = editorSettings?.customEditorCommand || '';
+    editorCustomInputEl.focus();
+    return;
+  }
+
+  editorCustomFormEl.hidden = true;
+  void saveEditorSettings(chosen, editorSettings?.customEditorCommand || '');
+});
+
+editorCustomFormEl.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const cmd = editorCustomInputEl.value.trim();
+  if (!cmd) {
+    editorSettingsErrorEl.textContent = 'Custom editor command is required';
+    editorSettingsErrorEl.hidden = false;
+    return;
+  }
+  void saveEditorSettings('custom', cmd);
+});
+
+filesSectionEl.addEventListener('dragenter', (event) => {
+  event.preventDefault();
+  dragDepth += 1;
+  filesSectionEl.classList.add('is-drag-over');
+  filesDropHintEl.hidden = false;
+});
+
+filesSectionEl.addEventListener('dragover', (event) => {
+  event.preventDefault();
+  if (event.dataTransfer) {
+    event.dataTransfer.dropEffect = 'copy';
+  }
+});
+
+filesSectionEl.addEventListener('dragleave', (event) => {
+  event.preventDefault();
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) {
+    filesSectionEl.classList.remove('is-drag-over');
+    filesDropHintEl.hidden = true;
+  }
+});
+
+filesSectionEl.addEventListener('drop', (event) => {
+  event.preventDefault();
+  dragDepth = 0;
+  filesSectionEl.classList.remove('is-drag-over');
+  filesDropHintEl.hidden = true;
+  const files = event.dataTransfer?.files;
+  if (files && files.length > 0) {
+    void handleUploadFiles(files);
+  }
+});
+
+document.addEventListener('click', (event) => {
+  if (!openMenuForFile) return;
+  if (event.target instanceof Element && event.target.closest('.open-split')) {
+    return;
+  }
+  openMenuForFile = null;
+  renderFiles();
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && openMenuForFile !== null) {
+    openMenuForFile = null;
+    renderFiles();
+  }
+});
+
+filesListEl.addEventListener('scroll', () => {
+  if (openMenuForFile !== null) {
+    openMenuForFile = null;
+    renderFiles();
+  }
+});
+
+appShellEl.addEventListener('scroll', () => {
+  if (openMenuForFile !== null) {
+    openMenuForFile = null;
+    renderFiles();
   }
 });
 
