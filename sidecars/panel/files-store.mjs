@@ -307,7 +307,7 @@ export function createFileStore(options = {}) {
       }));
     },
 
-    async saveFile({ scope, workspaceUri, filename, content, encoding = 'utf8' } = {}) {
+    async saveFile({ scope, workspaceUri, filename, content, encoding = 'utf8', overwrite = false } = {}) {
       const scopeInfo = resolveScope(scope, workspaceUri);
       const cleanName = sanitizeFileName(filename);
 
@@ -317,6 +317,9 @@ export function createFileStore(options = {}) {
       if (encoding !== 'utf8' && encoding !== 'base64') {
         throw new ValidationError('encoding must be "utf8" or "base64"');
       }
+      if (typeof overwrite !== 'boolean') {
+        throw new ValidationError('overwrite must be a boolean');
+      }
 
       const buffer = Buffer.from(content, encoding);
       if (buffer.length > maxFileBytes) {
@@ -325,11 +328,26 @@ export function createFileStore(options = {}) {
 
       return enqueueScope(scopeInfo.scopeKey, () => {
         mkdirSync(scopeInfo.directory, { recursive: true });
-        const uniqueName = resolveUniqueFileName(scopeInfo.directory, cleanName);
-        const destPath = join(scopeInfo.directory, uniqueName);
+        let targetName;
+        let destPath;
+        if (overwrite) {
+          targetName = cleanName;
+          destPath = join(scopeInfo.directory, targetName);
+          try {
+            lstatSync(destPath);
+            assertContainedPath(scopeInfo.directory, destPath);
+          } catch (error) {
+            if (!(error && (error.code === 'ENOENT' || error.code === 'ENOTDIR'))) {
+              throw error;
+            }
+          }
+        } else {
+          targetName = resolveUniqueFileName(scopeInfo.directory, cleanName);
+          destPath = join(scopeInfo.directory, targetName);
+        }
         writeBufferAtomic(destPath, buffer);
         const st = statSync(destPath);
-        const savedFile = buildFileEntry(uniqueName, destPath, st, scopeInfo.scope);
+        const savedFile = buildFileEntry(targetName, destPath, st, scopeInfo.scope);
         return {
           scope: scopeInfo.scope,
           files: readFilesList(scopeInfo),
@@ -433,6 +451,27 @@ export function createFileStore(options = {}) {
       return enqueueScope(scopeInfo.scopeKey, () => {
         const targetPath = join(scopeInfo.directory, cleanName);
         return assertContainedPath(scopeInfo.directory, targetPath);
+      });
+    },
+
+    async readFile({ scope, workspaceUri, filename, encoding = 'utf8' } = {}) {
+      const scopeInfo = resolveScope(scope, workspaceUri);
+      const cleanName = sanitizeFileName(filename);
+      if (encoding !== 'utf8' && encoding !== 'base64') {
+        throw new ValidationError('encoding must be "utf8" or "base64"');
+      }
+
+      return enqueueScope(scopeInfo.scopeKey, () => {
+        const targetPath = join(scopeInfo.directory, cleanName);
+        const realPath = assertContainedPath(scopeInfo.directory, targetPath);
+        const st = statSync(realPath);
+        const buf = readFileSync(realPath);
+        return {
+          scope: scopeInfo.scope,
+          file: buildFileEntry(cleanName, targetPath, st, scopeInfo.scope),
+          content: buf.toString(encoding),
+          encoding,
+        };
       });
     },
 

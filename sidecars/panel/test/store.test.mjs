@@ -9,6 +9,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -283,4 +284,52 @@ test('6. Corrupt JSON file is quarantined and getScratchpad returns a fresh empt
   const quarantined = files.filter((f) => f.startsWith(`${info.projectKey}.corrupt.`));
   assert.equal(quarantined.length, 1);
   assert.equal(readFileSync(join(projectsDir, quarantined[0]), 'utf8'), '{truncated');
+});
+
+test('7. Two independent createStore instances serialize writes via file lock without losing todos', async (t) => {
+  const root = makeTempDir('agy-todo-multistore-');
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dataDir = join(root, 'data');
+  const projectDir = join(root, 'repo');
+  mkdirSync(projectDir, { recursive: true });
+
+  const storeA = createStore({ dataDir });
+  const storeB = createStore({ dataDir });
+
+  await Promise.all([
+    storeA.addTodo(projectDir, 'From A1'),
+    storeB.addTodo(projectDir, 'From B1'),
+    storeA.addTodo(projectDir, 'From A2'),
+    storeB.addTodo(projectDir, 'From B2'),
+  ]);
+
+  const pad = await storeA.getScratchpad(projectDir);
+  const texts = pad.todos.map((item) => item.text).sort();
+  assert.deepEqual(texts, ['From A1', 'From A2', 'From B1', 'From B2']);
+
+  const info = resolveProject(projectDir);
+  assert.equal(existsSync(join(dataDir, 'projects', `${info.projectKey}.json.lock`)), false);
+  assert.equal(existsSync(join(dataDir, 'index.json.lock')), false);
+});
+
+test('8. Stale lockfiles are evicted and cleaned up during mutations', async (t) => {
+  const root = makeTempDir('agy-todo-stale-lock-');
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dataDir = join(root, 'data');
+  const projectDir = join(root, 'repo');
+  const projectsDir = join(dataDir, 'projects');
+  mkdirSync(projectDir, { recursive: true });
+  mkdirSync(projectsDir, { recursive: true });
+
+  const info = resolveProject(projectDir);
+  const staleLock = join(projectsDir, `${info.projectKey}.json.lock`);
+  writeFileSync(staleLock, 'stale', 'utf8');
+  const oldDate = new Date(Date.now() - 60_000);
+  utimesSync(staleLock, oldDate, oldDate);
+
+  const store = createStore({ dataDir });
+  const pad = await store.addTodo(projectDir, 'Recovered after stale lock');
+  assert.equal(pad.todos.length, 1);
+  assert.equal(pad.todos[0].text, 'Recovered after stale lock');
+  assert.equal(existsSync(staleLock), false);
 });

@@ -295,6 +295,49 @@
     return Buffer.from(bytes).toString('base64');
   }
 
+  /**
+   * Returns true when a background refresh may safely update the notes textarea
+   * without clobbering active typing or a pending debounced autosave.
+   * @param {{ isFocused?: boolean, hasPending?: boolean }} [options]
+   * @returns {boolean}
+   */
+  function shouldApplyNotesRefresh({ isFocused = false, hasPending = false } = {}) {
+    return !isFocused && !hasPending;
+  }
+
+  /**
+   * Compares two file metadata lists for additions, deletions, renames, or stat changes.
+   * @param {Array<{ name?: string, size?: number, updatedAt?: string | number, path?: string }>} prevFiles
+   * @param {Array<{ name?: string, size?: number, updatedAt?: string | number, path?: string }>} nextFiles
+   * @returns {boolean}
+   */
+  function haveFilesListChanged(prevFiles, nextFiles) {
+    const prev = Array.isArray(prevFiles) ? prevFiles : [];
+    const next = Array.isArray(nextFiles) ? nextFiles : [];
+    if (prev.length !== next.length) {
+      return true;
+    }
+    for (let i = 0; i < prev.length; i += 1) {
+      const a = prev[i];
+      const b = next[i];
+      if (!a || !b) {
+        if (a !== b) {
+          return true;
+        }
+        continue;
+      }
+      if (
+        a.name !== b.name ||
+        a.size !== b.size ||
+        a.updatedAt !== b.updatedAt ||
+        a.path !== b.path
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   return {
     escapeHtml,
     partitionTodos,
@@ -305,5 +348,7 @@
     formatFileSize,
     normalizeNewMarkdownFilename,
     arrayBufferToBase64,
+    shouldApplyNotesRefresh,
+    haveFilesListChanged,
   };
 });

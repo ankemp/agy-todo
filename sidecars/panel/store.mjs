@@ -1,16 +1,21 @@
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
+  closeSync,
   existsSync,
+  fstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   realpathSync,
   renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
 export class ValidationError extends Error {
@@ -236,6 +241,74 @@ function requireNonEmptyString(value, fieldName) {
   return value.trim();
 }
 
+async function withFileLock(lockPath, fn, { timeoutMs = 5000, staleMs = 15000 } = {}) {
+  mkdirSync(dirname(lockPath), { recursive: true });
+  const deadline = Date.now() + timeoutMs;
+  let fd;
+
+  while (true) {
+    try {
+      fd = openSync(lockPath, 'wx');
+      break;
+    } catch (error) {
+      if (!error || error.code !== 'EEXIST') {
+        throw error;
+      }
+
+      // Evict stale locks left behind by crashed processes.
+      try {
+        const st = statSync(lockPath);
+        if (Date.now() - st.mtimeMs > staleMs) {
+          try {
+            unlinkSync(lockPath);
+          } catch (unlinkErr) {
+            if (unlinkErr && unlinkErr.code !== 'ENOENT') {
+              throw unlinkErr;
+            }
+          }
+          continue;
+        }
+      } catch (statErr) {
+        if (statErr && statErr.code === 'ENOENT') {
+          continue;
+        }
+        throw statErr;
+      }
+
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for lock: ${lockPath}`);
+      }
+
+      await delay(10 + Math.floor(Math.random() * 15));
+    }
+  }
+
+  try {
+    return await fn();
+  } finally {
+    let ownsLock = true;
+    try {
+      const fdStat = fstatSync(fd);
+      const pathStat = statSync(lockPath);
+      ownsLock = fdStat.ino === pathStat.ino;
+    } catch {
+      ownsLock = false;
+    }
+    try {
+      closeSync(fd);
+    } catch {
+      // Best-effort fd close.
+    }
+    if (ownsLock) {
+      try {
+        unlinkSync(lockPath);
+      } catch {
+        // Best-effort lock cleanup.
+      }
+    }
+  }
+}
+
 /**
  * Create an atomic, per-project serialized JSON scratchpad store.
  */
@@ -268,27 +341,29 @@ export function createStore(options = {}) {
   }
 
   function enqueueIndexUpdate(project, updatedAt) {
-    const run = indexQueue.then(() => {
-      let indexData = {};
-      if (existsSync(indexFile)) {
-        try {
-          const parsed = JSON.parse(readFileSync(indexFile, 'utf8'));
-          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-            indexData = parsed;
-          } else {
+    const run = indexQueue.then(() =>
+      withFileLock(`${indexFile}.lock`, () => {
+        let indexData = {};
+        if (existsSync(indexFile)) {
+          try {
+            const parsed = JSON.parse(readFileSync(indexFile, 'utf8'));
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              indexData = parsed;
+            } else {
+              quarantineCorruptFile(indexFile, 'index');
+            }
+          } catch {
             quarantineCorruptFile(indexFile, 'index');
           }
-        } catch {
-          quarantineCorruptFile(indexFile, 'index');
         }
-      }
-      indexData[project.projectKey] = {
-        canonicalPath: project.canonicalPath,
-        displayName: project.displayName,
-        updatedAt,
-      };
-      writeJsonAtomic(indexFile, indexData);
-    });
+        indexData[project.projectKey] = {
+          canonicalPath: project.canonicalPath,
+          displayName: project.displayName,
+          updatedAt,
+        };
+        writeJsonAtomic(indexFile, indexData);
+      }),
+    );
     indexQueue = run.catch(() => {});
     return run;
   }
@@ -313,14 +388,16 @@ export function createStore(options = {}) {
 
   async function mutateProject(workspaceUri, mutator) {
     const project = resolveProject(workspaceUri);
-    return enqueueProject(project.projectKey, async () => {
-      const pad = loadProjectScratchpad(project);
-      mutator(pad, project);
-      pad.updatedAt = new Date().toISOString();
-      writeJsonAtomic(projectFilePath(project.projectKey), pad);
-      await enqueueIndexUpdate(project, pad.updatedAt);
-      return pad;
-    });
+    return enqueueProject(project.projectKey, () =>
+      withFileLock(`${projectFilePath(project.projectKey)}.lock`, async () => {
+        const pad = loadProjectScratchpad(project);
+        mutator(pad, project);
+        pad.updatedAt = new Date().toISOString();
+        writeJsonAtomic(projectFilePath(project.projectKey), pad);
+        await enqueueIndexUpdate(project, pad.updatedAt);
+        return pad;
+      }),
+    );
   }
 
   return {

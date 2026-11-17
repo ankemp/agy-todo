@@ -24,6 +24,8 @@ const {
   formatFileSize,
   normalizeNewMarkdownFilename,
   arrayBufferToBase64,
+  shouldApplyNotesRefresh,
+  haveFilesListChanged,
 } = loadHelpers(helpersTarget, helpersTarget);
 
 test('escapeHtml neutralizes HTML tags and attribute quotes', () => {
@@ -291,4 +293,81 @@ test('public/app.js is valid classic JS, avoids raw HTML sinks, and wires all fi
   ]) {
     assert.ok(appJs.includes(route), `Expected app.js to reference ${route}`);
   }
+});
+
+test('shouldApplyNotesRefresh only allows refresh when notes input is blurred and has no pending autosave', () => {
+  assert.equal(shouldApplyNotesRefresh(), true);
+  assert.equal(shouldApplyNotesRefresh({}), true);
+  assert.equal(shouldApplyNotesRefresh({ isFocused: false, hasPending: false }), true);
+  assert.equal(shouldApplyNotesRefresh({ isFocused: true, hasPending: false }), false);
+  assert.equal(shouldApplyNotesRefresh({ isFocused: false, hasPending: true }), false);
+  assert.equal(shouldApplyNotesRefresh({ isFocused: true, hasPending: true }), false);
+});
+
+test('haveFilesListChanged detects additions, deletions, renames, and size or updatedAt changes', () => {
+  const base = [
+    { name: 'notes.md', size: 120, updatedAt: '2026-01-01T00:00:00.000Z', path: '/tmp/notes.md' },
+    { name: 'plan.md', size: 450, updatedAt: '2026-01-01T00:01:00.000Z', path: '/tmp/plan.md' },
+  ];
+
+  // Identical entries (cloned objects)
+  assert.equal(
+    haveFilesListChanged(
+      base,
+      base.map((f) => ({ ...f })),
+    ),
+    false,
+  );
+  assert.equal(haveFilesListChanged([], []), false);
+  assert.equal(haveFilesListChanged(null, []), false);
+
+  // Addition
+  assert.equal(
+    haveFilesListChanged(base, [
+      ...base,
+      { name: 'extra.md', size: 10, updatedAt: '2026-01-01T00:02:00.000Z', path: '/tmp/extra.md' },
+    ]),
+    true,
+  );
+
+  // Deletion
+  assert.equal(haveFilesListChanged(base, [base[0]]), true);
+
+  // Rename
+  assert.equal(
+    haveFilesListChanged(base, [
+      { ...base[0], name: 'renamed.md', path: '/tmp/renamed.md' },
+      base[1],
+    ]),
+    true,
+  );
+
+  // Size change
+  assert.equal(
+    haveFilesListChanged(base, [
+      { ...base[0], size: 125 },
+      base[1],
+    ]),
+    true,
+  );
+
+  // updatedAt change
+  assert.equal(
+    haveFilesListChanged(base, [
+      base[0],
+      { ...base[1], updatedAt: '2026-01-01T00:05:00.000Z' },
+    ]),
+    true,
+  );
+});
+
+test('public/app.js implements refreshActiveWorkspace and wires focus, visibilitychange, and 3000ms polling', () => {
+  const appJs = readFileSync(join(publicDir, 'app.js'), 'utf8');
+
+  assert.match(appJs, /function\s+refreshActiveWorkspace\s*\(/);
+  assert.ok(appJs.includes('shouldApplyNotesRefresh'), 'Expected app.js to use shouldApplyNotesRefresh');
+  assert.ok(appJs.includes('haveFilesListChanged'), 'Expected app.js to use haveFilesListChanged');
+  assert.match(appJs, /window\.addEventListener\(\s*['"]focus['"]/);
+  assert.match(appJs, /document\.addEventListener\(\s*['"]visibilitychange['"]/);
+  assert.match(appJs, /setInterval\([\s\S]*refreshActiveWorkspace[\s\S]*3000/);
 });

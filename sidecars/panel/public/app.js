@@ -10,6 +10,8 @@ const {
   formatFileSize,
   normalizeNewMarkdownFilename,
   arrayBufferToBase64,
+  shouldApplyNotesRefresh,
+  haveFilesListChanged,
 } = window.AGYTodoHelpers;
 
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
@@ -87,6 +89,7 @@ let openMenuForFile = null;
 let filesLoadSeq = 0;
 let filesStatusTimer = null;
 let dragDepth = 0;
+let refreshInFlight = false;
 
 function setStatus(state, text) {
   saveStatusEl.textContent = text;
@@ -1004,6 +1007,78 @@ async function switchWorkspace(nextUri) {
   await filesPromise;
 }
 
+async function refreshActiveWorkspace() {
+  if (refreshInFlight) return;
+  if (!activeWorkspaceUri && activeFilesScope === 'project') return;
+
+  refreshInFlight = true;
+  const targetUri = activeWorkspaceUri;
+  const targetScope = activeFilesScope;
+  const startLoadSeq = loadSeq;
+  const startFilesLoadSeq = filesLoadSeq;
+
+  try {
+    const params = new URLSearchParams({ scope: targetScope });
+    if (targetScope === 'project' && targetUri) {
+      params.set('workspaceUri', targetUri);
+    }
+
+    try {
+      const filesData = await sidecarRequest(`/api/files?${params.toString()}`);
+      if (
+        targetScope === activeFilesScope &&
+        startFilesLoadSeq === filesLoadSeq &&
+        (targetScope !== 'project' || targetUri === activeWorkspaceUri)
+      ) {
+        const nextFiles = Array.isArray(filesData?.files) ? filesData.files : [];
+        if (
+          !editingFileName &&
+          !openMenuForFile &&
+          haveFilesListChanged(filesList, nextFiles)
+        ) {
+          filesList = nextFiles;
+          renderFiles();
+        }
+      }
+    } catch (err) {
+      console.error('Failed to refresh files:', err);
+    }
+
+    if (targetUri && targetUri === activeWorkspaceUri && startLoadSeq === loadSeq) {
+      try {
+        const nextScratchpad = await sidecarRequest(
+          `/api/scratchpad?workspaceUri=${encodeURIComponent(targetUri)}`
+        );
+        if (
+          targetUri === activeWorkspaceUri &&
+          startLoadSeq === loadSeq &&
+          nextScratchpad
+        ) {
+          scratchpad = nextScratchpad;
+          notesInputEl.disabled = false;
+          renderHeader();
+          renderLinks();
+          if (!editingTodoId) {
+            renderTodos();
+          }
+          if (
+            shouldApplyNotesRefresh({
+              isFocused: document.activeElement === notesInputEl,
+              hasPending: autosaver.hasPending(),
+            })
+          ) {
+            renderNotes();
+          }
+        }
+      } catch (err) {
+        console.error('Failed to refresh scratchpad:', err);
+      }
+    }
+  } finally {
+    refreshInFlight = false;
+  }
+}
+
 function enqueueWorkspaceUris(rawUris) {
   workspaceQueue = workspaceQueue
     .catch(() => {})
@@ -1388,8 +1463,20 @@ document.addEventListener('visibilitychange', () => {
     void autosaver.flush().catch((err) => {
       console.error('Failed to flush notes on visibilitychange:', err);
     });
+  } else if (document.visibilityState === 'visible') {
+    void refreshActiveWorkspace();
   }
 });
+
+window.addEventListener('focus', () => {
+  void refreshActiveWorkspace();
+});
+
+setInterval(() => {
+  if (document.visibilityState === 'visible') {
+    void refreshActiveWorkspace();
+  }
+}, 3000);
 
 window.addEventListener('beforeunload', () => {
   void autosaver.flush();

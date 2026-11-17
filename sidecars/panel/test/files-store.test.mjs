@@ -220,3 +220,83 @@ test('6. resolveUniqueFileName handles extensions, no-extension files, and dotfi
   writeFileSync(join(dir, 'archive.tar.gz'), '1');
   assert.equal(resolveUniqueFileName(dir, 'archive.tar.gz'), 'archive.tar-2.gz');
 });
+
+test('7. saveFile supports opt-in overwrite while preserving default unique renaming and symlink safety', async (t) => {
+  const root = makeTempDir();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dataDir = join(root, 'data');
+  const store = createFileStore({ dataDir });
+
+  await store.saveFile({ scope: 'global', filename: 'plan.md', content: 'v1' });
+  const autoRenamed = await store.saveFile({ scope: 'global', filename: 'plan.md', content: 'v2' });
+  assert.equal(autoRenamed.savedFile.name, 'plan-2.md');
+
+  const overwritten = await store.saveFile({
+    scope: 'global',
+    filename: 'plan.md',
+    content: 'v3-updated',
+    overwrite: true,
+  });
+  assert.equal(overwritten.savedFile.name, 'plan.md');
+  const readBack = await store.readFile({ scope: 'global', filename: 'plan.md' });
+  assert.equal(readBack.content, 'v3-updated');
+
+  // Non-boolean overwrite is rejected
+  await assert.rejects(
+    () => store.saveFile({ scope: 'global', filename: 'plan.md', content: 'bad', overwrite: 'yes' }),
+    (err) => err instanceof ValidationError,
+  );
+
+  // Symlink escape cannot be overwritten
+  const outsideFile = join(root, 'outside.md');
+  writeFileSync(outsideFile, 'untouched', 'utf8');
+  symlinkSync(outsideFile, join(dataDir, 'files', 'global', 'escape.md'));
+  await assert.rejects(
+    () => store.saveFile({ scope: 'global', filename: 'escape.md', content: 'pwned', overwrite: true }),
+    (err) => err instanceof ValidationError,
+  );
+  assert.equal(readFileSync(outsideFile, 'utf8'), 'untouched');
+});
+
+test('8. readFile returns utf8 and base64 contents and rejects missing, invalid encoding, or escaping paths', async (t) => {
+  const root = makeTempDir();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dataDir = join(root, 'data');
+  const store = createFileStore({ dataDir });
+
+  await store.saveFile({ scope: 'global', filename: 'note.md', content: '# Hello\n' });
+  const utf8Res = await store.readFile({ scope: 'global', filename: 'note.md' });
+  assert.equal(utf8Res.scope, 'global');
+  assert.equal(utf8Res.encoding, 'utf8');
+  assert.equal(utf8Res.file.name, 'note.md');
+  assert.equal(utf8Res.content, '# Hello\n');
+
+  const rawBytes = Buffer.from([0x00, 0xff, 0x42]);
+  await store.saveFile({
+    scope: 'global',
+    filename: 'bin.dat',
+    content: rawBytes.toString('base64'),
+    encoding: 'base64',
+  });
+  const b64Res = await store.readFile({ scope: 'global', filename: 'bin.dat', encoding: 'base64' });
+  assert.equal(b64Res.encoding, 'base64');
+  assert.equal(b64Res.content, rawBytes.toString('base64'));
+
+  await assert.rejects(
+    () => store.readFile({ scope: 'global', filename: 'missing.md' }),
+    (err) => err instanceof NotFoundError,
+  );
+  await assert.rejects(
+    () => store.readFile({ scope: 'global', filename: 'note.md', encoding: 'hex' }),
+    (err) => err instanceof ValidationError,
+  );
+
+  // Symlink escape is rejected
+  const outsideFile = join(root, 'secret.txt');
+  writeFileSync(outsideFile, 'top-secret', 'utf8');
+  symlinkSync(outsideFile, join(dataDir, 'files', 'global', 'escape-read.txt'));
+  await assert.rejects(
+    () => store.readFile({ scope: 'global', filename: 'escape-read.txt' }),
+    (err) => err instanceof ValidationError,
+  );
+});

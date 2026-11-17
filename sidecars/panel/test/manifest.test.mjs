@@ -41,3 +41,14 @@ test('sidecar.json uses snake_case AUX_PANE schema and ESM package.json', () => 
   assert.equal(panelPkg.type, 'module');
   assert.equal(existsSync(join(pluginRoot, '.gitignore')), true);
 });
+
+test('mcp_config.json and skills/todo/SKILL.md exist and follow plugin conventions', () => {
+  const mcpConfig = JSON.parse(readFileSync(join(pluginRoot, 'mcp_config.json'), 'utf8'));
+  assert.equal(mcpConfig.mcpServers?.['agy-todo']?.command, 'node');
+  assert.deepEqual(mcpConfig.mcpServers?.['agy-todo']?.args, ['${PLUGIN_ROOT}/mcp/server.mjs']);
+  assert.equal(existsSync(join(pluginRoot, 'mcp', 'server.mjs')), true);
+
+  const skillMd = readFileSync(join(pluginRoot, 'skills', 'todo', 'SKILL.md'), 'utf8');
+  assert.match(skillMd, /^---\n[\s\S]*?\bname:\s*todo\b[\s\S]*?\bdescription:\s*[^\n]+/m);
+  assert.match(skillMd, /save_file/);
+});
