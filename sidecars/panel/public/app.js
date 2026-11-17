@@ -12,6 +12,9 @@ const {
   arrayBufferToBase64,
   shouldApplyNotesRefresh,
   haveFilesListChanged,
+  computeThemeFromColor,
+  scratchpadRenderSignature,
+  filePathToUri,
 } = window.AGYTodoHelpers;
 
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
@@ -23,13 +26,17 @@ const OPEN_WITH_EDITORS = [
   { id: 'system', label: 'System Default' },
 ];
 
+const loadingStateEl = document.getElementById('loading-state');
 const emptyStateEl = document.getElementById('empty-state');
 const appShellEl = document.getElementById('app-shell');
+const appHeaderEl = document.getElementById('app-header');
 const statusDotEl = document.getElementById('status-dot');
 const projectNameEl = document.getElementById('project-name');
+const workspaceSelectWrapEl = document.getElementById('workspace-select-wrap');
 const workspaceSelectEl = document.getElementById('workspace-select');
 const saveStatusEl = document.getElementById('save-status');
 const exportBtnEl = document.getElementById('export-btn');
+const toastEl = document.getElementById('toast');
 
 const linksListEl = document.getElementById('links-list');
 const toggleLinkFormBtnEl = document.getElementById('toggle-link-form-btn');
@@ -46,6 +53,7 @@ const todoInputEl = document.getElementById('todo-input');
 const todosListEl = document.getElementById('todos-list');
 
 const filesSectionEl = document.getElementById('files-section');
+const filesTabListEl = filesSectionEl ? filesSectionEl.querySelector('[role="tablist"]') : null;
 const filesTabProjectEl = document.getElementById('files-tab-project');
 const filesTabGlobalEl = document.getElementById('files-tab-global');
 const fileNewBtnEl = document.getElementById('file-new-btn');
@@ -76,10 +84,12 @@ const notesInputEl = document.getElementById('notes-input');
 let workspaceUris = [];
 let activeWorkspaceUri = null;
 let scratchpad = null;
+let lastRenderedScratchpadSig = '';
 let editingTodoId = null;
 let loadSeq = 0;
 let workspaceQueue = Promise.resolve();
 let exportResetTimer = null;
+let toastTimer = null;
 
 let activeFilesScope = 'project';
 let filesList = [];
@@ -90,6 +100,94 @@ let filesLoadSeq = 0;
 let filesStatusTimer = null;
 let dragDepth = 0;
 let refreshInFlight = false;
+
+function syncScheme() {
+  let theme = null;
+  const rootEl = document.documentElement;
+  if (rootEl && typeof document.createElement === 'function' && typeof getComputedStyle === 'function') {
+    const probe = document.createElement('span');
+    probe.style.color = 'var(--background, #f7f7f8)';
+    probe.style.position = 'absolute';
+    probe.style.visibility = 'hidden';
+    probe.style.pointerEvents = 'none';
+    rootEl.appendChild(probe);
+    try {
+      theme = computeThemeFromColor(getComputedStyle(probe).color);
+    } finally {
+      probe.remove();
+    }
+  }
+  if (!theme) {
+    const prefersDark = Boolean(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    theme = prefersDark ? 'dark' : 'light';
+  }
+  if (rootEl && rootEl.dataset) {
+    rootEl.dataset.theme = theme;
+  }
+  return theme;
+}
+
+syncScheme();
+
+if (typeof MutationObserver === 'function' && document.documentElement) {
+  const themeObserver = new MutationObserver(() => {
+    syncScheme();
+  });
+  themeObserver.observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ['style'],
+  });
+}
+
+if (typeof window.matchMedia === 'function') {
+  const darkMql = window.matchMedia('(prefers-color-scheme: dark)');
+  if (darkMql && typeof darkMql.addEventListener === 'function') {
+    darkMql.addEventListener('change', () => {
+      syncScheme();
+    });
+  }
+}
+
+function setViewState(view) {
+  if (loadingStateEl) {
+    loadingStateEl.hidden = view !== 'loading';
+    loadingStateEl.setAttribute('aria-busy', view === 'loading' ? 'true' : 'false');
+  }
+  if (emptyStateEl) {
+    emptyStateEl.hidden = view !== 'empty';
+  }
+  if (appShellEl) {
+    appShellEl.hidden = view !== 'app';
+  }
+}
+
+function showToast(message, durationMs = 2600) {
+  if (!toastEl) return;
+  if (toastTimer) {
+    clearTimeout(toastTimer);
+    toastTimer = null;
+  }
+  if (!message) {
+    toastEl.hidden = true;
+    toastEl.textContent = '';
+    return;
+  }
+  toastEl.textContent = String(message);
+  toastEl.hidden = false;
+  if (durationMs > 0) {
+    toastTimer = setTimeout(() => {
+      toastEl.hidden = true;
+      toastEl.textContent = '';
+      toastTimer = null;
+    }, durationMs);
+  }
+}
+
+function updateHeaderStuck() {
+  if (appHeaderEl) {
+    appHeaderEl.classList.toggle('is-stuck', (window.scrollY || 0) > 0);
+  }
+}
 
 function setStatus(state, text) {
   saveStatusEl.textContent = text;
@@ -189,6 +287,9 @@ function renderWorkspaceSelector() {
 
   if (workspaceUris.length <= 1) {
     workspaceSelectEl.hidden = true;
+    if (workspaceSelectWrapEl) {
+      workspaceSelectWrapEl.hidden = true;
+    }
     return;
   }
 
@@ -200,6 +301,9 @@ function renderWorkspaceSelector() {
     workspaceSelectEl.appendChild(option);
   }
   workspaceSelectEl.hidden = false;
+  if (workspaceSelectWrapEl) {
+    workspaceSelectWrapEl.hidden = false;
+  }
 }
 
 function renderLinks() {
@@ -423,8 +527,57 @@ function renderFilesTabs() {
   const isProject = activeFilesScope === 'project';
   filesTabProjectEl.classList.toggle('is-active', isProject);
   filesTabProjectEl.setAttribute('aria-selected', isProject ? 'true' : 'false');
+  filesTabProjectEl.setAttribute('tabindex', isProject ? '0' : '-1');
   filesTabGlobalEl.classList.toggle('is-active', !isProject);
   filesTabGlobalEl.setAttribute('aria-selected', isProject ? 'false' : 'true');
+  filesTabGlobalEl.setAttribute('tabindex', isProject ? '-1' : '0');
+}
+
+function selectFilesScope(scope, { moveFocus = false } = {}) {
+  const nextScope = scope === 'global' ? 'global' : 'project';
+  if (moveFocus) {
+    const targetTab = nextScope === 'project' ? filesTabProjectEl : filesTabGlobalEl;
+    if (targetTab && typeof targetTab.focus === 'function') {
+      targetTab.focus();
+    }
+  }
+  if (activeFilesScope === nextScope) {
+    renderFilesTabs();
+    return;
+  }
+  activeFilesScope = nextScope;
+  editingFileName = null;
+  openMenuForFile = null;
+  filesList = [];
+  showFilesStatus('');
+  renderFiles();
+  void loadFiles(nextScope, activeWorkspaceUri);
+}
+
+async function previewFileInAgy(file) {
+  const uri = filePathToUri(file && file.path ? file.path : '');
+  const toggleAuxPane = window.sidecar?.ui?.toggleAuxPane;
+  if (typeof toggleAuxPane === 'function' && uri) {
+    try {
+      await toggleAuxPane({ tabType: 'fileView', uri });
+    } catch (err) {
+      console.error('Failed to preview file in Antigravity:', err);
+      showToast(err?.message || 'Failed to preview file in Antigravity');
+    }
+    return;
+  }
+  showToast('Native file preview requires Antigravity; use Open to launch external editor.');
+}
+
+function restoreOpenMenuFocus(targetFile) {
+  if (!targetFile || !filesListEl) return;
+  const toggles = filesListEl.querySelectorAll('.open-split-toggle');
+  for (const toggle of toggles) {
+    if (toggle.getAttribute('data-file') === targetFile || toggle.dataset?.file === targetFile) {
+      toggle.focus();
+      return;
+    }
+  }
 }
 
 function renderEditorSettings() {
@@ -509,16 +662,17 @@ function renderFiles() {
     const mainDiv = document.createElement('div');
     mainDiv.className = 'file-main';
 
-    const nameSpan = document.createElement('span');
-    nameSpan.className = 'file-name';
-    nameSpan.textContent = file.name;
-    nameSpan.title = `${file.path} (double-click to rename)`;
-    nameSpan.addEventListener('dblclick', () => {
+    const nameBtn = document.createElement('button');
+    nameBtn.type = 'button';
+    nameBtn.className = 'file-name';
+    nameBtn.textContent = file.name;
+    nameBtn.title = `Preview ${file.name} (${file.path})`;
+    nameBtn.setAttribute('aria-label', `Preview ${file.name}`);
+    nameBtn.addEventListener('click', () => {
       openMenuForFile = null;
-      editingFileName = file.name;
-      renderFiles();
+      void previewFileInAgy(file);
     });
-    mainDiv.appendChild(nameSpan);
+    mainDiv.appendChild(nameBtn);
 
     const sizeSpan = document.createElement('span');
     sizeSpan.className = 'file-size';
@@ -554,6 +708,7 @@ function renderFiles() {
       const copied = await copyTextToClipboard(mention);
       if (copied) {
         flashButtonLabel(attachBtn, 'Copied @', 'Attach');
+        showToast('Copied @path mention to clipboard');
       } else {
         showFilesStatus(`Clipboard unavailable. Copy manually: ${mention}`, true, 6000);
       }
@@ -570,6 +725,7 @@ function renderFiles() {
       const copied = await copyTextToClipboard(file.path);
       if (copied) {
         flashButtonLabel(copyBtn, 'Copied!', 'Copy');
+        showToast('Copied file path to clipboard');
       } else {
         showFilesStatus(`Clipboard unavailable. Path: ${file.path}`, true, 6000);
       }
@@ -595,6 +751,7 @@ function renderFiles() {
     openToggleBtn.type = 'button';
     openToggleBtn.className = 'btn btn-xs file-action-btn open-split-toggle';
     openToggleBtn.title = 'Open with…';
+    openToggleBtn.setAttribute('data-file', file.name);
     openToggleBtn.setAttribute('aria-label', `Open ${file.name} with specific editor`);
     openToggleBtn.setAttribute('aria-haspopup', 'menu');
     openToggleBtn.setAttribute('aria-expanded', openMenuForFile === file.name ? 'true' : 'false');
@@ -610,8 +767,14 @@ function renderFiles() {
       const menu = document.createElement('div');
       menu.className = 'open-with-menu';
       menu.setAttribute('role', 'menu');
+      menu.setAttribute('aria-label', `Open options for ${file.name}`);
 
-      for (const opt of OPEN_WITH_EDITORS) {
+      const menuOptions = [
+        { id: '__preview__', label: 'Preview in AGY' },
+        ...OPEN_WITH_EDITORS,
+      ];
+
+      for (const opt of menuOptions) {
         const item = document.createElement('button');
         item.type = 'button';
         item.className = 'open-with-item';
@@ -621,15 +784,43 @@ function renderFiles() {
           event.stopPropagation();
           openMenuForFile = null;
           renderFiles();
-          void handleOpenFile(file.name, opt.id);
+          if (opt.id === '__preview__') {
+            void previewFileInAgy(file);
+          } else {
+            void handleOpenFile(file.name, opt.id);
+          }
         });
         menu.appendChild(item);
       }
+
+      menu.addEventListener('keydown', (event) => {
+        const items = Array.from(menu.querySelectorAll('[role="menuitem"]'));
+        if (items.length === 0) return;
+        const currentIndex = items.indexOf(document.activeElement);
+        let nextIndex = null;
+        if (event.key === 'ArrowDown') {
+          nextIndex = currentIndex === -1 ? 0 : (currentIndex + 1) % items.length;
+        } else if (event.key === 'ArrowUp') {
+          nextIndex = currentIndex === -1 ? items.length - 1 : (currentIndex - 1 + items.length) % items.length;
+        } else if (event.key === 'Home') {
+          nextIndex = 0;
+        } else if (event.key === 'End') {
+          nextIndex = items.length - 1;
+        }
+        if (nextIndex !== null) {
+          event.preventDefault();
+          items[nextIndex].focus();
+        }
+      });
 
       openSplit.appendChild(menu);
       queueMicrotask(() => {
         if (menu.isConnected && openToggleBtn.isConnected) {
           positionOpenWithMenu(menu, openToggleBtn);
+          const firstItem = menu.querySelector('[role="menuitem"]');
+          if (firstItem) {
+            firstItem.focus();
+          }
         }
       });
     }
@@ -920,6 +1111,7 @@ async function applyMutation(fn) {
     renderHeader();
     renderLinks();
     renderTodos();
+    lastRenderedScratchpadSig = scratchpadRenderSignature(scratchpad);
     setStatus('saved', 'Saved');
   } catch (err) {
     if (targetUri === activeWorkspaceUri) {
@@ -934,6 +1126,7 @@ async function handleDeleteLink(id) {
     await applyMutation((uri) => postJson('/api/links/delete', { workspaceUri: uri, id }));
   } catch (err) {
     console.error('Failed to delete link:', err);
+    showToast(err?.message || 'Failed to remove link');
   }
 }
 
@@ -942,6 +1135,7 @@ async function handleToggleTodo(id, done) {
     await applyMutation((uri) => postJson('/api/todos/toggle', { workspaceUri: uri, id, done }));
   } catch (err) {
     console.error('Failed to toggle todo:', err);
+    showToast(err?.message || 'Failed to update todo');
   }
 }
 
@@ -950,6 +1144,7 @@ async function handleUpdateTodo(id, text) {
     await applyMutation((uri) => postJson('/api/todos/update', { workspaceUri: uri, id, text }));
   } catch (err) {
     console.error('Failed to update todo:', err);
+    showToast(err?.message || 'Failed to rename todo');
   }
 }
 
@@ -958,6 +1153,7 @@ async function handleDeleteTodo(id) {
     await applyMutation((uri) => postJson('/api/todos/delete', { workspaceUri: uri, id }));
   } catch (err) {
     console.error('Failed to delete todo:', err);
+    showToast(err?.message || 'Failed to delete todo');
   }
 }
 
@@ -969,6 +1165,7 @@ async function switchWorkspace(nextUri) {
   const seq = ++loadSeq;
   activeWorkspaceUri = nextUri;
   scratchpad = null;
+  lastRenderedScratchpadSig = '';
   editingTodoId = null;
   editingFileName = null;
   openMenuForFile = null;
@@ -978,8 +1175,7 @@ async function switchWorkspace(nextUri) {
   closeLinkForm();
   closeAllFilePanels();
   showFilesStatus('');
-  emptyStateEl.hidden = true;
-  appShellEl.hidden = false;
+  setViewState('app');
   renderHeader();
   renderWorkspaceSelector();
   renderLinks();
@@ -997,6 +1193,7 @@ async function switchWorkspace(nextUri) {
     scratchpad = data;
     notesInputEl.disabled = false;
     renderAll();
+    lastRenderedScratchpadSig = scratchpadRenderSignature(scratchpad);
     setStatus('saved', 'Saved');
   } catch (err) {
     if (seq !== loadSeq || nextUri !== activeWorkspaceUri) return;
@@ -1054,12 +1251,16 @@ async function refreshActiveWorkspace() {
           startLoadSeq === loadSeq &&
           nextScratchpad
         ) {
+          const nextSig = scratchpadRenderSignature(nextScratchpad);
           scratchpad = nextScratchpad;
           notesInputEl.disabled = false;
-          renderHeader();
-          renderLinks();
-          if (!editingTodoId) {
-            renderTodos();
+          if (nextSig !== lastRenderedScratchpadSig) {
+            renderHeader();
+            renderLinks();
+            if (!editingTodoId) {
+              renderTodos();
+            }
+            lastRenderedScratchpadSig = nextSig;
           }
           if (
             shouldApplyNotesRefresh({
@@ -1094,6 +1295,7 @@ function enqueueWorkspaceUris(rawUris) {
         filesLoadSeq++;
         activeWorkspaceUri = null;
         scratchpad = null;
+        lastRenderedScratchpadSig = '';
         editingTodoId = null;
         editingFileName = null;
         openMenuForFile = null;
@@ -1101,8 +1303,7 @@ function enqueueWorkspaceUris(rawUris) {
         closeLinkForm();
         closeAllFilePanels();
         showFilesStatus('');
-        appShellEl.hidden = true;
-        emptyStateEl.hidden = false;
+        setViewState('empty');
         return;
       }
 
@@ -1184,6 +1385,7 @@ todoAddFormEl.addEventListener('submit', async (event) => {
   } catch (err) {
     todoInputEl.value = text;
     console.error('Failed to add todo:', err);
+    showToast(err?.message || 'Failed to add todo');
   }
 });
 
@@ -1194,30 +1396,42 @@ clearDoneBtnEl.addEventListener('click', async () => {
     );
   } catch (err) {
     console.error('Failed to clear completed todos:', err);
+    showToast(err?.message || 'Failed to clear completed todos');
   }
 });
 
 filesTabProjectEl.addEventListener('click', () => {
-  if (activeFilesScope === 'project') return;
-  activeFilesScope = 'project';
-  editingFileName = null;
-  openMenuForFile = null;
-  filesList = [];
-  showFilesStatus('');
-  renderFiles();
-  void loadFiles('project', activeWorkspaceUri);
+  selectFilesScope('project');
 });
 
 filesTabGlobalEl.addEventListener('click', () => {
-  if (activeFilesScope === 'global') return;
-  activeFilesScope = 'global';
-  editingFileName = null;
-  openMenuForFile = null;
-  filesList = [];
-  showFilesStatus('');
-  renderFiles();
-  void loadFiles('global', activeWorkspaceUri);
+  selectFilesScope('global');
 });
+
+if (filesTabListEl) {
+  filesTabListEl.addEventListener('keydown', (event) => {
+    const tabs = ['project', 'global'];
+    const currentIndex = event.target === filesTabGlobalEl
+      ? 1
+      : event.target === filesTabProjectEl
+        ? 0
+        : (activeFilesScope === 'global' ? 1 : 0);
+    let nextIndex = null;
+    if (event.key === 'ArrowRight') {
+      nextIndex = (currentIndex + 1) % tabs.length;
+    } else if (event.key === 'ArrowLeft') {
+      nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+    } else if (event.key === 'Home') {
+      nextIndex = 0;
+    } else if (event.key === 'End') {
+      nextIndex = tabs.length - 1;
+    }
+    if (nextIndex !== null) {
+      event.preventDefault();
+      selectFilesScope(tabs[nextIndex], { moveFocus: true });
+    }
+  });
+}
 
 fileNewBtnEl.addEventListener('click', () => {
   if (fileNewFormEl.hidden) {
@@ -1427,8 +1641,11 @@ document.addEventListener('click', (event) => {
 
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && openMenuForFile !== null) {
+    event.preventDefault();
+    const targetFile = openMenuForFile;
     openMenuForFile = null;
     renderFiles();
+    restoreOpenMenuFocus(targetFile);
   }
 });
 
@@ -1445,6 +1662,14 @@ appShellEl.addEventListener('scroll', () => {
     renderFiles();
   }
 });
+
+window.addEventListener('scroll', () => {
+  updateHeaderStuck();
+  if (openMenuForFile !== null) {
+    openMenuForFile = null;
+    renderFiles();
+  }
+}, { passive: true });
 
 notesInputEl.addEventListener('input', () => {
   if (!activeWorkspaceUri) return;
@@ -1516,6 +1741,7 @@ exportBtnEl.addEventListener('click', async () => {
   }
 
   exportBtnEl.textContent = copied ? 'Copied!' : 'Downloaded';
+  showToast(copied ? 'Copied Markdown to clipboard' : 'Downloaded scratchpad Markdown');
   if (exportResetTimer) {
     clearTimeout(exportResetTimer);
   }
@@ -1535,7 +1761,10 @@ function showEmptyStateDetail(message) {
 }
 
 async function resolveWorkspaceFromConversation() {
-  const cid = window.sidecar?.conversationId;
+  const cid =
+    window.sidecar?.conversationId ||
+    new URLSearchParams(window.location?.search || '').get('conversationId') ||
+    '';
   const getMeta = window.sidecar?.agent?.getConversationMetadata;
   if (!cid || typeof getMeta !== 'function') {
     return [];

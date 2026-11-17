@@ -5,6 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import vm from 'node:vm';
 
 import { startServer } from '../main.mjs';
 
@@ -184,6 +185,131 @@ test('standalone mode serves static assets and /preload.js with accurate MIME ty
     const body = await res.text();
     assert.ok(body.includes(c.snippet), `Expected ${c.path} body to include ${c.snippet}`);
   }
+});
+
+test('standalone /preload.js supports conversationId, ?theme= presets, theme-change postMessage, and omits window.sidecar.ui', async (t) => {
+  const root = makeTempDir('agy-todo-preload-');
+  const dataDir = join(root, 'data');
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  const handle = await startServer({ port: 0, dataDir });
+  t.after(() => handle.close());
+  const baseUrl = `http://127.0.0.1:${handle.port}`;
+
+  const res = await fetch(`${baseUrl}/preload.js`);
+  assert.equal(res.status, 200);
+  const preloadCode = await res.text();
+
+  assert.ok(preloadCode.includes('theme-change'), 'Expected theme-change listener in /preload.js');
+  assert.ok(preloadCode.includes('conversationId'), 'Expected conversationId support in /preload.js');
+
+  function runPreload(search) {
+    const cssProps = new Map();
+    const eventHandlers = new Map();
+    const mockWindow = {
+      location: { search },
+      addEventListener(type, fn) {
+        if (!eventHandlers.has(type)) eventHandlers.set(type, []);
+        eventHandlers.get(type).push(fn);
+      },
+      fetch: async (url, opts) => ({ url, opts }),
+    };
+    const mockDocument = {
+      documentElement: {
+        style: {
+          setProperty(name, value) {
+            cssProps.set(name, value);
+          },
+        },
+      },
+    };
+    const context = {
+      window: mockWindow,
+      document: mockDocument,
+      URLSearchParams,
+      Headers,
+      console,
+    };
+    vm.runInNewContext(preloadCode, context);
+    return { sidecar: mockWindow.sidecar, cssProps, eventHandlers };
+  }
+
+  // Dark preset + conversationId + workspace + absent ui
+  const darkRun = runPreload('?theme=dark&conversationId=conv-123&workspace=file:///tmp/proj');
+  assert.equal(darkRun.sidecar.conversationId, 'conv-123');
+  assert.equal(darkRun.sidecar.ui, undefined);
+  assert.deepEqual(Array.from(await darkRun.sidecar.getWorkspaceUris()), ['file:///tmp/proj']);
+  for (const token of [
+    '--background',
+    '--foreground',
+    '--card',
+    '--card-border',
+    '--border',
+    '--primary',
+    '--primary-foreground',
+    '--secondary',
+    '--secondary-foreground',
+    '--muted',
+    '--muted-foreground',
+    '--placeholder',
+    '--error',
+    '--ring',
+    '--font-family',
+    '--editor-font-family',
+  ]) {
+    assert.ok(darkRun.cssProps.get(token), `Expected ${token} to be set for ?theme=dark`);
+  }
+
+  // Light preset applies distinct light background/foreground
+  const lightRun = runPreload('?theme=light');
+  assert.equal(lightRun.sidecar.conversationId, '');
+  assert.equal(lightRun.sidecar.ui, undefined);
+  for (const token of [
+    '--background',
+    '--foreground',
+    '--card',
+    '--card-border',
+    '--border',
+    '--primary',
+    '--primary-foreground',
+    '--secondary',
+    '--secondary-foreground',
+    '--muted',
+    '--muted-foreground',
+    '--placeholder',
+    '--error',
+    '--ring',
+    '--font-family',
+    '--editor-font-family',
+  ]) {
+    assert.ok(lightRun.cssProps.get(token), `Expected ${token} to be set for ?theme=light`);
+  }
+  assert.notEqual(
+    darkRun.cssProps.get('--background'),
+    lightRun.cssProps.get('--background'),
+    'Dark and light presets should set distinct --background colors',
+  );
+
+  // Live theme-change postMessage updates :root CSS variables
+  const msgRun = runPreload('');
+  assert.equal(msgRun.cssProps.has('--background'), false);
+  const messageHandlers = msgRun.eventHandlers.get('message') || [];
+  assert.ok(messageHandlers.length > 0, 'Expected message event listener on window');
+  for (const fn of messageHandlers) {
+    fn({
+      data: {
+        type: 'theme-change',
+        payload: {
+          cssVariables: {
+            '--background': '#111318',
+            '--foreground': '#e5e7eb',
+          },
+        },
+      },
+    });
+  }
+  assert.equal(msgRun.cssProps.get('--background'), '#111318');
+  assert.equal(msgRun.cssProps.get('--foreground'), '#e5e7eb');
 });
 
 test('standalone mode supports full scratchpad CRUD lifecycle and error status mapping', async (t) => {

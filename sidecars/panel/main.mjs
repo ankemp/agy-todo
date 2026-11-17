@@ -28,10 +28,77 @@ const STATIC_ROUTES = [
 ];
 
 const STANDALONE_PRELOAD_JS = `(() => {
+  const THEME_PRESETS = {
+    light: {
+      '--background': '#f7f7f8',
+      '--foreground': '#1d1f21',
+      '--card': '#ffffff',
+      '--card-border': 'rgba(0, 0, 0, 0.10)',
+      '--border': 'rgba(0, 0, 0, 0.08)',
+      '--primary': '#007acc',
+      '--primary-foreground': '#ffffff',
+      '--secondary': '#e6e7e9',
+      '--secondary-foreground': '#3d4348',
+      '--muted': '#eff0f1',
+      '--muted-foreground': '#5d676f',
+      '--placeholder': '#9da5ab',
+      '--error': '#cb3d3d',
+      '--ring': 'rgba(0, 122, 204, 0.70)',
+      '--font-family': '"Google Sans Flex", "Google Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+      '--editor-font-family': '"Google Sans Code", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
+    },
+    dark: {
+      '--background': '#111318',
+      '--foreground': '#e5e7eb',
+      '--card': '#181b22',
+      '--card-border': 'rgba(255, 255, 255, 0.10)',
+      '--border': 'rgba(255, 255, 255, 0.08)',
+      '--primary': '#3b9eff',
+      '--primary-foreground': '#0b1017',
+      '--secondary': '#232732',
+      '--secondary-foreground': '#c7ccd4',
+      '--muted': '#1c2029',
+      '--muted-foreground': '#949ba6',
+      '--placeholder': '#69707d',
+      '--error': '#ef6461',
+      '--ring': 'rgba(59, 158, 255, 0.70)',
+      '--font-family': '"Google Sans Flex", "Google Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+      '--editor-font-family': '"Google Sans Code", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
+    },
+  };
+
+  function applyCssVars(vars) {
+    if (!vars || typeof vars !== 'object') return;
+    const root = typeof document !== 'undefined' ? document.documentElement : null;
+    if (!root || !root.style) return;
+    for (const [key, value] of Object.entries(vars)) {
+      if (typeof key === 'string' && key.startsWith('--') && typeof value === 'string') {
+        root.style.setProperty(key, value);
+      }
+    }
+  }
+
+  function readParams() {
+    return new URLSearchParams(window.location.search);
+  }
+
   function readWorkspaces() {
-    const params = new URLSearchParams(window.location.search);
+    const params = readParams();
     return [...params.getAll('workspace'), ...params.getAll('workspaceUri')].filter(Boolean);
   }
+
+  const initialTheme = (readParams().get('theme') || '').toLowerCase();
+  if (initialTheme === 'dark' || initialTheme === 'light') {
+    applyCssVars(THEME_PRESETS[initialTheme]);
+  }
+
+  window.addEventListener('message', (event) => {
+    const data = event && event.data;
+    if (data && data.type === 'theme-change' && data.payload && data.payload.cssVariables) {
+      applyCssVars(data.payload.cssVariables);
+    }
+  });
+
   const listeners = new Set();
   window.addEventListener('popstate', () => {
     const uris = readWorkspaces();
@@ -44,6 +111,9 @@ const STANDALONE_PRELOAD_JS = `(() => {
     }
   });
   window.sidecar = {
+    get conversationId() {
+      return readParams().get('conversationId') || '';
+    },
     fetch(url, options = {}) {
       const headers = new Headers(options.headers || {});
       if (options.body && !headers.has('Content-Type')) {

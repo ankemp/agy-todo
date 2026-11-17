@@ -338,6 +338,102 @@
     return false;
   }
 
+  /**
+   * Classifies a computed CSS color string (`rgb(...)`, `rgba(...)`, or `color(srgb ...)`)
+   * as `'dark'` or `'light'` by relative luminance, returning `null` if invalid or transparent.
+   * @param {unknown} cssColor
+   * @returns {'dark' | 'light' | null}
+   */
+  function computeThemeFromColor(cssColor) {
+    if (typeof cssColor !== 'string') {
+      return null;
+    }
+    const trimmed = cssColor.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    const srgbMatch = trimmed.match(/^color\(\s*srgb\s+([^)]+)\)$/i);
+    const rgbMatch = !srgbMatch ? trimmed.match(/^rgba?\(\s*([^)]+)\s*\)$/i) : null;
+    if (!srgbMatch && !rgbMatch) {
+      return null;
+    }
+
+    const body = (srgbMatch ? srgbMatch[1] : rgbMatch[1]).trim();
+    const nums = (body.match(/[-+]?(?:\d*\.\d+|\d+)(?:e[-+]?\d+)?/gi) || []).map(Number);
+    if (nums.length < 3 || nums.slice(0, 4).some((n) => !Number.isFinite(n))) {
+      return null;
+    }
+    if (nums.length >= 4 && nums[3] <= 0) {
+      return null;
+    }
+
+    const scale = srgbMatch ? 1 : 255;
+    const r = nums[0] / scale;
+    const g = nums[1] / scale;
+    const b = nums[2] / scale;
+    const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    return lum < 0.5 ? 'dark' : 'light';
+  }
+
+  /**
+   * Builds a deterministic render signature over header identity, links, and todos
+   * (explicitly excluding `notes` and `updatedAt`) so polling skips redundant DOM re-renders.
+   * @param {unknown} scratchpad
+   * @returns {string}
+   */
+  function scratchpadRenderSignature(scratchpad) {
+    if (!scratchpad || typeof scratchpad !== 'object' || Array.isArray(scratchpad)) {
+      return '';
+    }
+    const displayName = typeof scratchpad.displayName === 'string' ? scratchpad.displayName : '';
+    const canonicalPath = typeof scratchpad.canonicalPath === 'string' ? scratchpad.canonicalPath : '';
+    const links = (Array.isArray(scratchpad.links) ? scratchpad.links : []).map((link) => ({
+      id: link && link.id != null ? String(link.id) : '',
+      label: link && typeof link.label === 'string' ? link.label : '',
+      url: link && typeof link.url === 'string' ? link.url : '',
+    }));
+    const todos = (Array.isArray(scratchpad.todos) ? scratchpad.todos : []).map((todo) => ({
+      id: todo && todo.id != null ? String(todo.id) : '',
+      text: todo && typeof todo.text === 'string' ? todo.text : '',
+      done: Boolean(todo && todo.done),
+    }));
+    return JSON.stringify({ displayName, canonicalPath, links, todos });
+  }
+
+  /**
+   * Converts a POSIX or Windows filesystem path into a percent-encoded `file://` URI.
+   * @param {unknown} filePath
+   * @returns {string}
+   */
+  function filePathToUri(filePath) {
+    if (typeof filePath !== 'string') {
+      return '';
+    }
+    const trimmed = filePath.trim();
+    if (!trimmed) {
+      return '';
+    }
+
+    let normalized = trimmed.replace(/\\/g, '/');
+    if (/^[A-Za-z]:(?:\/|$)/.test(normalized)) {
+      normalized = '/' + normalized;
+    } else if (!normalized.startsWith('/')) {
+      normalized = '/' + normalized;
+    }
+
+    const encodedSegments = normalized
+      .slice(1)
+      .split('/')
+      .map((segment, index) => (
+        index === 0 && /^[A-Za-z]:$/.test(segment)
+          ? segment
+          : encodeURIComponent(segment)
+      ));
+
+    return 'file:///' + encodedSegments.join('/');
+  }
+
   return {
     escapeHtml,
     partitionTodos,
@@ -350,5 +446,8 @@
     arrayBufferToBase64,
     shouldApplyNotesRefresh,
     haveFilesListChanged,
+    computeThemeFromColor,
+    scratchpadRenderSignature,
+    filePathToUri,
   };
 });

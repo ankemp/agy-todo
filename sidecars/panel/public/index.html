@@ -4,13 +4,41 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AGY Todo</title>
-  <link rel="stylesheet" href="/styles.css">
   <script src="/preload.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" media="print" onload="this.media='all'"
+    href="https://fonts.googleapis.com/css2?family=Google+Sans+Flex:ROND,opsz,slnt,wdth,wght@0..100,6..144,-10..0,92..100,100..1000&family=Google+Sans+Code:ital,wght@0,300..800;1,300..800&display=swap">
+  <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <main id="root" class="pane-root">
-    <section id="empty-state" class="empty-state" aria-label="No workspace open">
+    <section id="loading-state" class="loading" aria-live="polite" aria-busy="true">
+      <div class="loading-header">
+        <span class="skel" style="width: 140px; height: 18px;"></span>
+        <span class="skel" style="width: 78px; height: 24px;"></span>
+      </div>
+      <div class="loading-section">
+        <span class="skel" style="width: 48%; height: 22px;"></span>
+        <span class="skel" style="width: 100%; height: 32px;"></span>
+      </div>
+      <div class="loading-section">
+        <span class="skel" style="width: 24%; height: 12px;"></span>
+        <span class="skel" style="width: 92%; height: 18px;"></span>
+        <span class="skel" style="width: 78%; height: 18px;"></span>
+      </div>
+      <div class="loading-section">
+        <span class="skel" style="width: 20%; height: 12px;"></span>
+        <span class="skel" style="width: 100%; height: 96px;"></span>
+      </div>
+    </section>
+
+    <section id="empty-state" class="empty-state" aria-label="No workspace open" hidden>
       <div class="empty-card">
+        <svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect class="empty-icon-stroke" x="4" y="3" width="16" height="18" rx="2.5"></rect>
+          <path class="empty-icon-stroke" d="M8 8.5h8M8 12.5h8M8 16.5h5"></path>
+        </svg>
         <p class="empty-title">No workspace open</p>
         <p class="empty-description">
           Open a project folder or repository in Antigravity to load its personal links, todos, and notes.
@@ -23,7 +51,9 @@
         <div class="project-identity">
           <span id="status-dot" class="status-dot" aria-hidden="true"></span>
           <h1 id="project-name" class="project-name">Project</h1>
-          <select id="workspace-select" class="workspace-select" aria-label="Switch active workspace" hidden></select>
+          <span id="workspace-select-wrap" class="select" hidden>
+            <select id="workspace-select" class="workspace-select" aria-label="Switch active workspace" hidden></select>
+          </span>
         </div>
         <div class="header-actions">
           <span id="save-status" class="save-status" aria-live="polite">Saved</span>
@@ -69,9 +99,9 @@
         <div class="section-header files-header">
           <div class="section-title-group">
             <h2 class="section-title">Files</h2>
-            <div class="scope-tabs" role="tablist" aria-label="File storage scope">
-              <button id="files-tab-project" class="scope-tab is-active" type="button" role="tab" aria-selected="true">Project</button>
-              <button id="files-tab-global" class="scope-tab" type="button" role="tab" aria-selected="false">Global</button>
+            <div class="segmented scope-tabs" role="tablist" aria-label="File storage scope">
+              <button id="files-tab-project" class="scope-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="files-list" tabindex="0">Project</button>
+              <button id="files-tab-global" class="scope-tab" type="button" role="tab" aria-selected="false" aria-controls="files-list" tabindex="-1">Global</button>
             </div>
           </div>
           <div class="files-toolbar">
@@ -86,14 +116,16 @@
         <div id="editor-settings-panel" class="files-inline-form" hidden>
           <div class="editor-settings-row">
             <label class="editor-settings-label" for="editor-default-select">Default editor</label>
-            <select id="editor-default-select" class="editor-select" aria-label="Default external editor">
-              <option value="system">System Default</option>
-              <option value="subl">Sublime Text</option>
-              <option value="code">VS Code</option>
-              <option value="cursor">Cursor</option>
-              <option value="agy">Antigravity</option>
-              <option value="custom">Custom Command</option>
-            </select>
+            <span class="select">
+              <select id="editor-default-select" class="editor-select" aria-label="Default external editor">
+                <option value="system">System Default</option>
+                <option value="subl">Sublime Text</option>
+                <option value="code">VS Code</option>
+                <option value="cursor">Cursor</option>
+                <option value="agy">Antigravity</option>
+                <option value="custom">Custom Command</option>
+              </select>
+            </span>
           </div>
           <form id="editor-custom-form" class="editor-custom-form" hidden>
             <input id="editor-custom-input" class="input" type="text" placeholder="e.g. zed --wait" aria-label="Custom editor command" autocomplete="off">
@@ -137,6 +169,8 @@
         <textarea id="notes-input" class="notes-input" placeholder="Jot down project notes, commands, or reminders…" aria-label="Project notes"></textarea>
       </section>
     </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   </main>
 
   <script src="/helpers.js"></script>
