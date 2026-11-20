@@ -9,8 +9,9 @@ Route requests for AGY Todo through the `agy-todo` MCP tools so files and scratc
 
 ## Tool Mapping
 
-- **Save a markdown doc / note file:** `save_file` (`filename` defaults to `.md`; `overwrite: false` by default so collisions auto-suffix `-2`, `-3`; set `overwrite: true` ONLY when the user explicitly asks to update or overwrite an existing file).
-- **List or read saved files:** `list_files`, `read_file`.
+- **Save or append a markdown doc / note file:** `save_file` (`filename` defaults to `.md`; `overwrite: false` auto-suffixes collisions `-2`, `-3`; use `append: true` to append verbatim or create if missing; set `overwrite: true` only when replacing the full file).
+- **Edit an existing text file in place:** `edit_file` (exact verbatim `target` → `replacement` on the exact filename; replaces every occurrence).
+- **List or read saved files:** `list_files`, `read_file` (supports optional `startLine`, `endLine`, `byteOffset` for UTF-8 paging).
 - **Add or toggle a checklist item:** `add_todo`, `toggle_todo`.
 - **Append or replace scratchpad notes:** `append_notes` (`mode: "append"` or `"replace"`).
 - **Save a URL / inspect current state:** `add_link`, `get_scratchpad`.

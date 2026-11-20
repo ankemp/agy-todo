@@ -241,7 +241,10 @@ function requireNonEmptyString(value, fieldName) {
   return value.trim();
 }
 
-async function withFileLock(lockPath, fn, { timeoutMs = 5000, staleMs = 15000 } = {}) {
+/**
+ * Execute `fn` while holding an exclusive advisory lockfile at `lockPath`.
+ */
+export async function withFileLock(lockPath, fn, { timeoutMs = 5000, staleMs = 15000 } = {}) {
   mkdirSync(dirname(lockPath), { recursive: true });
   const deadline = Date.now() + timeoutMs;
   let fd;

@@ -2,7 +2,12 @@ import { realpathSync } from 'node:fs';
 import { extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { MAX_FILE_BYTES, createFileStore } from '../sidecars/panel/files-store.mjs';
+import {
+  DEFAULT_MAX_READ_BYTES,
+  DEFAULT_MAX_READ_LINES,
+  MAX_FILE_BYTES,
+  createFileStore,
+} from '../sidecars/panel/files-store.mjs';
 import { ValidationError, createStore } from '../sidecars/panel/store.mjs';
 
 const PROTOCOL_VERSION = '2024-11-05';
@@ -15,7 +20,7 @@ const TOOLS = [
   {
     name: 'save_file',
     description:
-      'Save a file (such as a Markdown document) to AGY Todo sidecar storage without writing into the project repository. Extensionless non-dotfiles default to .md. Collisions auto-suffix (-2, -3) unless overwrite is true.',
+      'Save or append a file (such as a Markdown document) to AGY Todo sidecar storage without writing into the project repository. Extensionless non-dotfiles default to .md. Collisions auto-suffix (-2, -3) unless overwrite or append is true.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -48,8 +53,47 @@ const TOOLS = [
           default: false,
           description: 'Replace an existing file with the same name when true; otherwise auto-rename.',
         },
+        append: {
+          type: 'boolean',
+          default: false,
+          description:
+            'Append content verbatim to an existing file (or create it if missing). Cannot be combined with overwrite=true.',
+        },
       },
       required: ['filename', 'content'],
+    },
+  },
+  {
+    name: 'edit_file',
+    description:
+      'Edit an existing UTF-8 text file in AGY Todo sidecar storage by replacing exact target text with replacement text. Use for a single contiguous block of edits; make separate calls for non-adjacent regions. Target must match existing text verbatim including whitespace; every occurrence of target in the file is replaced. Leave replacement empty to delete target.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        filename: {
+          type: 'string',
+          description: 'Single-segment file name to edit (exact filename, no .md auto-append).',
+        },
+        target: {
+          type: 'string',
+          description: 'Exact verbatim text to replace, including whitespace.',
+        },
+        replacement: {
+          type: 'string',
+          description: 'Replacement text (use an empty string to delete target).',
+        },
+        scope: {
+          type: 'string',
+          enum: ['project', 'global'],
+          default: 'project',
+          description: 'Storage scope ("project" requires workspaceUri; "global" is shared across projects).',
+        },
+        workspaceUri: {
+          type: 'string',
+          description: 'Workspace filesystem path or file:// URI (required when scope is "project").',
+        },
+      },
+      required: ['filename', 'target', 'replacement'],
     },
   },
   {
@@ -73,7 +117,7 @@ const TOOLS = [
   },
   {
     name: 'read_file',
-    description: 'Read a saved file from AGY Todo sidecar storage.',
+    description: `Read a saved file from AGY Todo sidecar storage. Each UTF-8 read returns at most ${DEFAULT_MAX_READ_LINES} lines or ${DEFAULT_MAX_READ_BYTES} bytes.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -96,6 +140,21 @@ const TOOLS = [
           enum: ['utf8', 'base64'],
           default: 'utf8',
           description: 'Output content encoding.',
+        },
+        startLine: {
+          type: 'integer',
+          minimum: 1,
+          description: '1-based inclusive start line to read (utf8 encoding only).',
+        },
+        endLine: {
+          type: 'integer',
+          minimum: 1,
+          description: '1-based inclusive end line to read (utf8 encoding only).',
+        },
+        byteOffset: {
+          type: 'integer',
+          minimum: 0,
+          description: 'Byte offset into the selected line range for paging truncated UTF-8 reads.',
         },
       },
       required: ['filename'],
@@ -251,13 +310,8 @@ export function createMcpServer({ dataDir, store, fileStore } = {}) {
       const scope = args.scope === undefined ? 'project' : args.scope;
       const encoding = args.encoding === undefined ? 'utf8' : args.encoding;
       const overwrite = args.overwrite === undefined ? false : args.overwrite;
+      const append = args.append === undefined ? false : args.append;
       const targetName = normalizeSaveFilename(args.filename);
-
-      let existedBefore = false;
-      if (overwrite === true) {
-        const listed = await resolvedFileStore.listFiles(scope, args.workspaceUri);
-        existedBefore = listed.files.some((entry) => entry.name === targetName);
-      }
 
       const result = await resolvedFileStore.saveFile({
         scope,
@@ -266,13 +320,32 @@ export function createMcpServer({ dataDir, store, fileStore } = {}) {
         content: args.content,
         encoding,
         overwrite,
+        append,
       });
 
       return {
         savedFile: result.savedFile,
         scope: result.scope,
-        renamed: overwrite === false && result.savedFile.name !== targetName,
-        overwritten: overwrite === true && existedBefore,
+        renamed: !overwrite && !append && result.savedFile.name !== targetName,
+        overwritten: overwrite === true && result.existedBefore,
+        appended: append === true && result.existedBefore,
+      };
+    },
+
+    async edit_file(args) {
+      const scope = args.scope === undefined ? 'project' : args.scope;
+      const result = await resolvedFileStore.editFile({
+        scope,
+        workspaceUri: args.workspaceUri,
+        filename: args.filename,
+        target: args.target,
+        replacement: args.replacement,
+      });
+
+      return {
+        file: result.file,
+        scope: result.scope,
+        replacements: result.replacements,
       };
     },
 
@@ -294,6 +367,9 @@ export function createMcpServer({ dataDir, store, fileStore } = {}) {
         workspaceUri: args.workspaceUri,
         filename: args.filename,
         encoding,
+        startLine: args.startLine,
+        endLine: args.endLine,
+        byteOffset: args.byteOffset,
       });
     },
 

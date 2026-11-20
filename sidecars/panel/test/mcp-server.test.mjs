@@ -186,11 +186,12 @@ test('MCP server handles initialize, ping, tools/list, files, scratchpad, and er
   const pingResp = await client.request('ping');
   assert.deepEqual(pingResp.result, {});
 
-  // 2. tools/list returns all 8 tools with schemas
+  // 2. tools/list returns all 9 tools with schemas
   const listToolsResp = await client.request('tools/list');
   const toolNames = listToolsResp.result.tools.map((tool) => tool.name);
   assert.deepEqual(toolNames, [
     'save_file',
+    'edit_file',
     'list_files',
     'read_file',
     'get_scratchpad',
@@ -220,6 +221,7 @@ test('MCP server handles initialize, ping, tools/list, files, scratchpad, and er
   assert.equal(save1.data.savedFile.name, 'architecture-notes.md');
   assert.equal(save1.data.renamed, false);
   assert.equal(save1.data.overwritten, false);
+  assert.equal(save1.data.appended, false);
   assert.deepEqual(readdirSync(projectDir), []);
   assert.equal(existsSync(save1.data.savedFile.path), true);
 
@@ -237,6 +239,7 @@ test('MCP server handles initialize, ping, tools/list, files, scratchpad, and er
   assert.equal(save2.data.savedFile.name, 'architecture-notes-2.md');
   assert.equal(save2.data.renamed, true);
   assert.equal(save2.data.overwritten, false);
+  assert.equal(save2.data.appended, false);
 
   const save3 = parseToolResult(
     await client.request('tools/call', {
@@ -253,6 +256,7 @@ test('MCP server handles initialize, ping, tools/list, files, scratchpad, and er
   assert.equal(save3.data.savedFile.name, 'architecture-notes.md');
   assert.equal(save3.data.renamed, false);
   assert.equal(save3.data.overwritten, true);
+  assert.equal(save3.data.appended, false);
 
   // 4. list_files & read_file in project and global scopes
   const listedProject = parseToolResult(
@@ -348,6 +352,163 @@ test('MCP server handles initialize, ping, tools/list, files, scratchpad, and er
   );
   assert.equal(binRead.data.encoding, 'base64');
   assert.equal(binRead.data.content, rawBytes.toString('base64'));
+
+  // 4b. save_file(append), edit_file, and read_file line/byte slicing
+  const appendCreate = parseToolResult(
+    await client.request('tools/call', {
+      name: 'save_file',
+      arguments: {
+        filename: 'append-log',
+        content: 'entry-1\n',
+        workspaceUri,
+        append: true,
+      },
+    }),
+  );
+  assert.equal(appendCreate.isError, false);
+  assert.equal(appendCreate.data.savedFile.name, 'append-log.md');
+  assert.equal(appendCreate.data.renamed, false);
+  assert.equal(appendCreate.data.overwritten, false);
+  assert.equal(appendCreate.data.appended, false);
+
+  const appendSecond = parseToolResult(
+    await client.request('tools/call', {
+      name: 'save_file',
+      arguments: {
+        filename: 'append-log',
+        content: 'entry-2\n',
+        workspaceUri,
+        append: true,
+      },
+    }),
+  );
+  assert.equal(appendSecond.isError, false);
+  assert.equal(appendSecond.data.savedFile.name, 'append-log.md');
+  assert.equal(appendSecond.data.renamed, false);
+  assert.equal(appendSecond.data.overwritten, false);
+  assert.equal(appendSecond.data.appended, true);
+
+  const readAppended = parseToolResult(
+    await client.request('tools/call', {
+      name: 'read_file',
+      arguments: {
+        filename: 'append-log.md',
+        workspaceUri,
+      },
+    }),
+  );
+  assert.equal(readAppended.isError, false);
+  assert.equal(readAppended.data.content, 'entry-1\nentry-2\n');
+
+  const saveForEdit = parseToolResult(
+    await client.request('tools/call', {
+      name: 'save_file',
+      arguments: {
+        filename: 'edit-target',
+        content: 'alpha\n- [ ] task\n- [ ] task\nomega\n',
+        workspaceUri,
+      },
+    }),
+  );
+  assert.equal(saveForEdit.isError, false);
+  assert.equal(saveForEdit.data.savedFile.name, 'edit-target.md');
+
+  const editProjectMulti = parseToolResult(
+    await client.request('tools/call', {
+      name: 'edit_file',
+      arguments: {
+        filename: 'edit-target.md',
+        target: '- [ ] task',
+        replacement: '- [x] task',
+        workspaceUri,
+      },
+    }),
+  );
+  assert.equal(editProjectMulti.isError, false);
+  assert.equal(editProjectMulti.data.scope, 'project');
+  assert.equal(editProjectMulti.data.file.name, 'edit-target.md');
+  assert.equal(editProjectMulti.data.replacements, 2);
+
+  const readEditedProject = parseToolResult(
+    await client.request('tools/call', {
+      name: 'read_file',
+      arguments: {
+        filename: 'edit-target.md',
+        workspaceUri,
+      },
+    }),
+  );
+  assert.equal(readEditedProject.isError, false);
+  assert.equal(readEditedProject.data.content, 'alpha\n- [x] task\n- [x] task\nomega\n');
+  assert.equal(readEditedProject.data.totalLines, 4);
+  assert.equal(readEditedProject.data.startLine, 1);
+  assert.equal(readEditedProject.data.endLine, 4);
+  assert.equal(readEditedProject.data.truncated, false);
+
+  const editGlobalSingle = parseToolResult(
+    await client.request('tools/call', {
+      name: 'edit_file',
+      arguments: {
+        filename: 'global-memo.md',
+        target: 'Shared across',
+        replacement: 'Available in',
+        scope: 'global',
+      },
+    }),
+  );
+  assert.equal(editGlobalSingle.isError, false);
+  assert.equal(editGlobalSingle.data.scope, 'global');
+  assert.equal(editGlobalSingle.data.file.name, 'global-memo.md');
+  assert.equal(editGlobalSingle.data.replacements, 1);
+
+  const readEditedGlobal = parseToolResult(
+    await client.request('tools/call', {
+      name: 'read_file',
+      arguments: {
+        filename: 'global-memo.md',
+        scope: 'global',
+      },
+    }),
+  );
+  assert.equal(readEditedGlobal.isError, false);
+  assert.equal(readEditedGlobal.data.content, 'Available in workspaces');
+
+  const readSliced = parseToolResult(
+    await client.request('tools/call', {
+      name: 'read_file',
+      arguments: {
+        filename: 'edit-target.md',
+        scope: 'project',
+        workspaceUri,
+        startLine: 2,
+        endLine: 3,
+      },
+    }),
+  );
+  assert.equal(readSliced.isError, false);
+  assert.equal(readSliced.data.content, '- [x] task\n- [x] task\n');
+  assert.equal(readSliced.data.totalLines, 4);
+  assert.equal(readSliced.data.startLine, 2);
+  assert.equal(readSliced.data.endLine, 3);
+  assert.equal(readSliced.data.truncated, false);
+
+  const readByteOffset = parseToolResult(
+    await client.request('tools/call', {
+      name: 'read_file',
+      arguments: {
+        filename: 'edit-target.md',
+        scope: 'project',
+        workspaceUri,
+        startLine: 1,
+        endLine: 1,
+        byteOffset: 2,
+      },
+    }),
+  );
+  assert.equal(readByteOffset.isError, false);
+  assert.equal(readByteOffset.data.content, 'pha\n');
+  assert.equal(readByteOffset.data.startLine, 1);
+  assert.equal(readByteOffset.data.endLine, 1);
 
   // 5. scratchpad tools: add_todo, toggle_todo, append_notes, add_link, get_scratchpad
   const addedTodo = parseToolResult(
@@ -448,6 +609,83 @@ test('MCP server handles initialize, ping, tools/list, files, scratchpad, and er
     arguments: { filename: 'does-not-exist.md', scope: 'global' },
   });
   assert.equal(missingFileResp.result.isError, true);
+
+  const overwriteAndAppendResp = await client.request('tools/call', {
+    name: 'save_file',
+    arguments: {
+      filename: 'append-log',
+      content: 'conflict',
+      workspaceUri,
+      overwrite: true,
+      append: true,
+    },
+  });
+  assert.equal(overwriteAndAppendResp.result.isError, true);
+
+  const editMissingTargetResp = await client.request('tools/call', {
+    name: 'edit_file',
+    arguments: {
+      filename: 'edit-target.md',
+      target: 'does-not-exist-in-file',
+      replacement: 'x',
+      workspaceUri,
+    },
+  });
+  assert.equal(editMissingTargetResp.result.isError, true);
+
+  const editMissingFileResp = await client.request('tools/call', {
+    name: 'edit_file',
+    arguments: {
+      filename: 'does-not-exist.md',
+      target: 'a',
+      replacement: 'b',
+      scope: 'global',
+    },
+  });
+  assert.equal(editMissingFileResp.result.isError, true);
+
+  const editBinaryFileResp = await client.request('tools/call', {
+    name: 'edit_file',
+    arguments: {
+      filename: 'blob.bin',
+      target: 'B',
+      replacement: 'C',
+      scope: 'global',
+    },
+  });
+  assert.equal(editBinaryFileResp.result.isError, true);
+
+  const verifyUntouchedAfterErr = parseToolResult(
+    await client.request('tools/call', {
+      name: 'read_file',
+      arguments: { filename: 'edit-target.md', workspaceUri },
+    }),
+  );
+  assert.equal(verifyUntouchedAfterErr.data.content, 'alpha\n- [x] task\n- [x] task\nomega\n');
+
+  const readInvalidStartResp = await client.request('tools/call', {
+    name: 'read_file',
+    arguments: { filename: 'edit-target.md', workspaceUri, startLine: 0 },
+  });
+  assert.equal(readInvalidStartResp.result.isError, true);
+
+  const readInvalidRangeResp = await client.request('tools/call', {
+    name: 'read_file',
+    arguments: { filename: 'edit-target.md', workspaceUri, startLine: 3, endLine: 2 },
+  });
+  assert.equal(readInvalidRangeResp.result.isError, true);
+
+  const readOutOfBoundsStartResp = await client.request('tools/call', {
+    name: 'read_file',
+    arguments: { filename: 'edit-target.md', workspaceUri, startLine: 99 },
+  });
+  assert.equal(readOutOfBoundsStartResp.result.isError, true);
+
+  const readBase64SliceResp = await client.request('tools/call', {
+    name: 'read_file',
+    arguments: { filename: 'blob.bin', scope: 'global', encoding: 'base64', startLine: 1 },
+  });
+  assert.equal(readBase64SliceResp.result.isError, true);
 
   const unknownToolResp = await client.request('tools/call', {
     name: 'nonexistent_tool',

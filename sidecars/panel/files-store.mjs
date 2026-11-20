@@ -15,9 +15,11 @@ import { homedir } from 'node:os';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { NotFoundError, ValidationError, resolveProject } from './store.mjs';
+import { NotFoundError, ValidationError, resolveProject, withFileLock } from './store.mjs';
 
 export const MAX_FILE_BYTES = 10 * 1024 * 1024;
+export const DEFAULT_MAX_READ_LINES = 800;
+export const DEFAULT_MAX_READ_BYTES = 46080;
 export const VALID_EDITORS = ['system', 'subl', 'code', 'cursor', 'agy', 'custom'];
 
 function defaultDataDir() {
@@ -172,6 +174,59 @@ function assertContainedPath(scopeDir, targetPath) {
   return realTarget;
 }
 
+function resolveExistingContainedPath(scopeDir, targetPath) {
+  try {
+    lstatSync(targetPath);
+  } catch (error) {
+    if (error && (error.code === 'ENOENT' || error.code === 'ENOTDIR')) {
+      return null;
+    }
+    throw error;
+  }
+  return assertContainedPath(scopeDir, targetPath);
+}
+
+function validateReadSliceOptions({ encoding, startLine, endLine, byteOffset }) {
+  if (encoding === 'base64') {
+    if (startLine !== undefined || endLine !== undefined || byteOffset !== undefined) {
+      throw new ValidationError(
+        'startLine, endLine, and byteOffset are only supported for utf8 encoding',
+      );
+    }
+    return;
+  }
+  if (startLine !== undefined && (!Number.isInteger(startLine) || startLine < 1)) {
+    throw new ValidationError('startLine must be an integer >= 1');
+  }
+  if (endLine !== undefined && (!Number.isInteger(endLine) || endLine < 1)) {
+    throw new ValidationError('endLine must be an integer >= 1');
+  }
+  if (startLine !== undefined && endLine !== undefined && endLine < startLine) {
+    throw new ValidationError('endLine must be >= startLine');
+  }
+  if (byteOffset !== undefined && (!Number.isInteger(byteOffset) || byteOffset < 0)) {
+    throw new ValidationError('byteOffset must be an integer >= 0');
+  }
+}
+
+function sliceUtf8Buffer(buf, startByte, maxBytes) {
+  let cutEnd = Math.min(buf.length, startByte + maxBytes);
+  while (cutEnd > startByte && cutEnd < buf.length && (buf[cutEnd] & 0xc0) === 0x80) {
+    cutEnd -= 1;
+  }
+  // If maxBytes < 4 falls inside the very first multi-byte char, include the whole char so paging advances.
+  if (cutEnd === startByte && startByte < buf.length) {
+    cutEnd = startByte + 1;
+    while (cutEnd < buf.length && (buf[cutEnd] & 0xc0) === 0x80) {
+      cutEnd += 1;
+    }
+  }
+  return {
+    text: buf.subarray(startByte, cutEnd).toString('utf8'),
+    nextByteOffset: cutEnd < buf.length ? cutEnd : undefined,
+  };
+}
+
 function buildFileEntry(name, filePath, stat, scope) {
   return {
     name,
@@ -211,7 +266,18 @@ export function createFileStore(options = {}) {
       ? options.maxFileBytes
       : MAX_FILE_BYTES;
 
+  const maxReadLines =
+    Number.isInteger(options.maxReadLines) && options.maxReadLines > 0
+      ? options.maxReadLines
+      : DEFAULT_MAX_READ_LINES;
+
+  const maxReadBytes =
+    Number.isInteger(options.maxReadBytes) && options.maxReadBytes > 0
+      ? options.maxReadBytes
+      : DEFAULT_MAX_READ_BYTES;
+
   const filesRoot = join(dataDir, 'files');
+  const locksRoot = join(dataDir, 'locks', 'files');
   const settingsFile = join(dataDir, 'settings.json');
   const scopeQueues = new Map();
   let settingsQueue = Promise.resolve();
@@ -226,6 +292,17 @@ export function createFileStore(options = {}) {
     });
     scopeQueues.set(scopeKey, tail);
     return next;
+  }
+
+  function scopeLockPath(scopeInfo) {
+    return join(
+      locksRoot,
+      scopeInfo.scope === 'global' ? 'global.lock' : `project-${scopeInfo.projectKey}.lock`,
+    );
+  }
+
+  function runScopeMutation(scopeInfo, task) {
+    return enqueueScope(scopeInfo.scopeKey, () => withFileLock(scopeLockPath(scopeInfo), task));
   }
 
   function enqueueSettings(task) {
@@ -307,7 +384,15 @@ export function createFileStore(options = {}) {
       }));
     },
 
-    async saveFile({ scope, workspaceUri, filename, content, encoding = 'utf8', overwrite = false } = {}) {
+    async saveFile({
+      scope,
+      workspaceUri,
+      filename,
+      content,
+      encoding = 'utf8',
+      overwrite = false,
+      append = false,
+    } = {}) {
       const scopeInfo = resolveScope(scope, workspaceUri);
       const cleanName = sanitizeFileName(filename);
 
@@ -320,38 +405,101 @@ export function createFileStore(options = {}) {
       if (typeof overwrite !== 'boolean') {
         throw new ValidationError('overwrite must be a boolean');
       }
+      if (typeof append !== 'boolean') {
+        throw new ValidationError('append must be a boolean');
+      }
+      if (overwrite && append) {
+        throw new ValidationError('overwrite and append cannot both be true');
+      }
 
       const buffer = Buffer.from(content, encoding);
       if (buffer.length > maxFileBytes) {
         throw new ValidationError(`File exceeds maximum size of ${maxFileBytes} bytes`);
       }
 
-      return enqueueScope(scopeInfo.scopeKey, () => {
+      return runScopeMutation(scopeInfo, () => {
         mkdirSync(scopeInfo.directory, { recursive: true });
         let targetName;
         let destPath;
-        if (overwrite) {
+        let writeBuf = buffer;
+        let existedBefore = false;
+
+        if (append || overwrite) {
           targetName = cleanName;
           destPath = join(scopeInfo.directory, targetName);
-          try {
-            lstatSync(destPath);
-            assertContainedPath(scopeInfo.directory, destPath);
-          } catch (error) {
-            if (!(error && (error.code === 'ENOENT' || error.code === 'ENOTDIR'))) {
-              throw error;
+          const existingRealPath = resolveExistingContainedPath(scopeInfo.directory, destPath);
+          if (existingRealPath !== null) {
+            existedBefore = true;
+            if (append) {
+              const existingBuf = readFileSync(existingRealPath);
+              writeBuf = Buffer.concat([existingBuf, buffer]);
+              if (writeBuf.length > maxFileBytes) {
+                throw new ValidationError(`File exceeds maximum size of ${maxFileBytes} bytes`);
+              }
             }
           }
         } else {
           targetName = resolveUniqueFileName(scopeInfo.directory, cleanName);
           destPath = join(scopeInfo.directory, targetName);
         }
-        writeBufferAtomic(destPath, buffer);
+
+        writeBufferAtomic(destPath, writeBuf);
         const st = statSync(destPath);
         const savedFile = buildFileEntry(targetName, destPath, st, scopeInfo.scope);
         return {
           scope: scopeInfo.scope,
           files: readFilesList(scopeInfo),
           savedFile,
+          existedBefore,
+        };
+      });
+    },
+
+    async editFile({ scope, workspaceUri, filename, target, replacement } = {}) {
+      const scopeInfo = resolveScope(scope, workspaceUri);
+      const cleanName = sanitizeFileName(filename);
+
+      if (typeof target !== 'string' || target.length === 0) {
+        throw new ValidationError('target must be a non-empty string');
+      }
+      if (typeof replacement !== 'string') {
+        throw new ValidationError('replacement must be a string');
+      }
+
+      return runScopeMutation(scopeInfo, () => {
+        const targetPath = join(scopeInfo.directory, cleanName);
+        const realPath = assertContainedPath(scopeInfo.directory, targetPath);
+        const existingBuf = readFileSync(realPath);
+        if (existingBuf.includes(0)) {
+          throw new ValidationError('Cannot edit binary file containing NUL bytes');
+        }
+        let existingText;
+        try {
+          existingText = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(
+            existingBuf,
+          );
+        } catch {
+          throw new ValidationError('Cannot edit invalid UTF-8 file');
+        }
+
+        // Literal split/join avoids `$` substitution sequences interpreted by String.prototype.replaceAll.
+        const parts = existingText.split(target);
+        const replacements = parts.length - 1;
+        if (replacements === 0) {
+          throw new ValidationError('Target text not found in file');
+        }
+
+        const nextBuf = Buffer.from(parts.join(replacement), 'utf8');
+        if (nextBuf.length > maxFileBytes) {
+          throw new ValidationError(`File exceeds maximum size of ${maxFileBytes} bytes`);
+        }
+
+        writeBufferAtomic(targetPath, nextBuf);
+        const st = statSync(targetPath);
+        return {
+          scope: scopeInfo.scope,
+          file: buildFileEntry(cleanName, targetPath, st, scopeInfo.scope),
+          replacements,
         };
       });
     },
@@ -383,7 +531,7 @@ export function createFileStore(options = {}) {
         throw new ValidationError(`File exceeds maximum size of ${maxFileBytes} bytes`);
       }
 
-      return enqueueScope(scopeInfo.scopeKey, () => {
+      return runScopeMutation(scopeInfo, () => {
         mkdirSync(scopeInfo.directory, { recursive: true });
         const uniqueName = resolveUniqueFileName(scopeInfo.directory, cleanName);
         const destPath = join(scopeInfo.directory, uniqueName);
@@ -403,7 +551,7 @@ export function createFileStore(options = {}) {
       const cleanOld = sanitizeFileName(filename);
       const cleanNew = sanitizeFileName(newFilename);
 
-      return enqueueScope(scopeInfo.scopeKey, () => {
+      return runScopeMutation(scopeInfo, () => {
         const oldPath = join(scopeInfo.directory, cleanOld);
         assertContainedPath(scopeInfo.directory, oldPath);
 
@@ -433,7 +581,7 @@ export function createFileStore(options = {}) {
       const scopeInfo = resolveScope(scope, workspaceUri);
       const cleanName = sanitizeFileName(filename);
 
-      return enqueueScope(scopeInfo.scopeKey, () => {
+      return runScopeMutation(scopeInfo, () => {
         const targetPath = join(scopeInfo.directory, cleanName);
         assertContainedPath(scopeInfo.directory, targetPath);
         unlinkSync(targetPath);
@@ -454,23 +602,93 @@ export function createFileStore(options = {}) {
       });
     },
 
-    async readFile({ scope, workspaceUri, filename, encoding = 'utf8' } = {}) {
+    async readFile({
+      scope,
+      workspaceUri,
+      filename,
+      encoding = 'utf8',
+      startLine,
+      endLine,
+      byteOffset,
+    } = {}) {
       const scopeInfo = resolveScope(scope, workspaceUri);
       const cleanName = sanitizeFileName(filename);
       if (encoding !== 'utf8' && encoding !== 'base64') {
         throw new ValidationError('encoding must be "utf8" or "base64"');
       }
+      validateReadSliceOptions({ encoding, startLine, endLine, byteOffset });
 
       return enqueueScope(scopeInfo.scopeKey, () => {
         const targetPath = join(scopeInfo.directory, cleanName);
         const realPath = assertContainedPath(scopeInfo.directory, targetPath);
         const st = statSync(realPath);
         const buf = readFileSync(realPath);
+        const file = buildFileEntry(cleanName, targetPath, st, scopeInfo.scope);
+
+        if (encoding === 'base64') {
+          return {
+            scope: scopeInfo.scope,
+            file,
+            content: buf.toString('base64'),
+            encoding,
+          };
+        }
+
+        const fullText = buf.toString('utf8');
+        const lines = fullText.match(/[^\n]*\n|[^\n]+/g) || [];
+        const totalLines = lines.length;
+        const startByte = byteOffset ?? 0;
+
+        if (totalLines === 0) {
+          if (startLine !== undefined && startLine > 1) {
+            throw new ValidationError(`startLine (${startLine}) exceeds total lines (0)`);
+          }
+          if (startByte > 0) {
+            throw new ValidationError(`byteOffset (${startByte}) exceeds file length (0)`);
+          }
+          return {
+            scope: scopeInfo.scope,
+            file,
+            content: '',
+            encoding,
+            totalLines: 0,
+            startLine: 0,
+            endLine: 0,
+            truncated: false,
+          };
+        }
+
+        const effectiveStart = startLine ?? 1;
+        if (effectiveStart > totalLines) {
+          throw new ValidationError(
+            `startLine (${effectiveStart}) exceeds total lines (${totalLines})`,
+          );
+        }
+        const requestedEnd = endLine === undefined ? totalLines : Math.min(endLine, totalLines);
+        const cappedEnd = Math.min(requestedEnd, effectiveStart + maxReadLines - 1);
+        const truncatedByLines = cappedEnd < requestedEnd;
+
+        const selectedText = lines.slice(effectiveStart - 1, cappedEnd).join('');
+        const selectedBuf = Buffer.from(selectedText, 'utf8');
+        if (startByte >= selectedBuf.length) {
+          throw new ValidationError(
+            `byteOffset (${startByte}) exceeds selected byte length (${selectedBuf.length})`,
+          );
+        }
+
+        const { text, nextByteOffset } = sliceUtf8Buffer(selectedBuf, startByte, maxReadBytes);
+        const truncatedByBytes = nextByteOffset !== undefined;
+
         return {
           scope: scopeInfo.scope,
-          file: buildFileEntry(cleanName, targetPath, st, scopeInfo.scope),
-          content: buf.toString(encoding),
+          file,
+          content: text,
           encoding,
+          totalLines,
+          startLine: effectiveStart,
+          endLine: cappedEnd,
+          truncated: truncatedByLines || truncatedByBytes,
+          ...(truncatedByBytes ? { nextByteOffset } : {}),
         };
       });
     },

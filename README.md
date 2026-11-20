@@ -9,7 +9,7 @@ A lightweight, project-scoped personal scratchpad plugin for Antigravity. It run
 - **Files shelf:** Project and Global tabs above Notes; upload via picker or drag-and-drop, create inline with `+ New .md`, or import by local path (10 MB limit, duplicate auto-renaming); copy `@<path>` mentions to attach, copy raw paths, open in external editors (`subl`, `code`, `cursor`, `agy`, system default, or custom), rename, and delete.
 - **Auto-saving notes:** Freeform notes pad that persists across workspace switches.
 - **Export `.md`:** Copy or download the active project's scratchpad as Markdown.
-- **Agent MCP & `/todo` skill:** Exposes an `agy-todo` stdio MCP server (`save_file`, `list_files`, `read_file`, `get_scratchpad`, `add_todo`, `toggle_todo`, `append_notes`, `add_link`) and a `/todo` skill so agents can save docs, todos, links, and notes directly into AGY Todo without touching target repositories, with live panel refresh.
+- **Agent MCP & `/todo` skill:** Exposes an `agy-todo` stdio MCP server (`save_file`, `edit_file`, `list_files`, `read_file`, `get_scratchpad`, `add_todo`, `toggle_todo`, `append_notes`, `add_link`) and a `/todo` skill so agents can save docs, todos, links, and notes directly into AGY Todo without touching target repositories, with live panel refresh.
 - **Zero dependencies & zero build step:** Uses only Node.js built-in modules, Antigravity `sidecar_sdk`, and vanilla HTML/CSS/JS.
 
 ## Layout

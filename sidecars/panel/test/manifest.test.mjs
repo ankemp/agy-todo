@@ -51,4 +51,5 @@ test('mcp_config.json and skills/todo/SKILL.md exist and follow plugin conventio
   const skillMd = readFileSync(join(pluginRoot, 'skills', 'todo', 'SKILL.md'), 'utf8');
   assert.match(skillMd, /^---\n[\s\S]*?\bname:\s*todo\b[\s\S]*?\bdescription:\s*[^\n]+/m);
   assert.match(skillMd, /save_file/);
+  assert.match(skillMd, /edit_file/);
 });
