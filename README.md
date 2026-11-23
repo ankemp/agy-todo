@@ -14,7 +14,27 @@ A lightweight, project-scoped personal scratchpad plugin for Antigravity. It run
 
 ## Installation
 
-Clone the repository anywhere on your machine and symlink it into `~/.gemini/config/plugins/agy-todo`. Only Node.js is required; there is no `npm install` or build step.
+Only Node.js is required; there is no `npm install` or build step. Both the Antigravity app and the `agy` CLI share plugins installed under `~/.gemini/config/plugins/`.
+
+### Option 1: Install with the `agy` CLI (recommended)
+
+```bash
+agy plugin install https://github.com/ankemp/agy-todo
+```
+
+This clones the repository into `~/.gemini/config/plugins/agy-todo`. Plugins installed from a GitHub URL do not auto-update; to pull future updates, run either:
+
+```bash
+# Pull new commits in place
+git -C ~/.gemini/config/plugins/agy-todo pull
+
+# Or replace the installed copy via agy
+agy plugin install https://github.com/ankemp/agy-todo
+```
+
+### Option 2: Clone and symlink (for local development)
+
+Clone the repository anywhere on your machine and symlink it into `~/.gemini/config/plugins/agy-todo`:
 
 ```bash
 git clone https://github.com/ankemp/agy-todo.git /path/to/agy-todo
@@ -22,15 +42,22 @@ mkdir -p ~/.gemini/config/plugins
 ln -s /path/to/agy-todo ~/.gemini/config/plugins/agy-todo
 ```
 
-Use an absolute source path in `ln -s`, because relative symlink targets resolve from `~/.gemini/config/plugins/`. Keep the link named `agy-todo` to match `plugin.json`. Antigravity keys plugin configuration on the directory name, and `mcp_config.json` resolves `${PLUGIN_ROOT}/mcp/server.mjs` from it.
+Use an absolute source path in `ln -s`, because relative symlink targets resolve from `~/.gemini/config/plugins/`. Keep the directory or link named `agy-todo` to match `plugin.json`—Antigravity keys plugin configuration on the directory name, and `mcp_config.json` resolves `${PLUGIN_ROOT}/mcp/server.mjs` from it. With a symlink, running `git pull` in `/path/to/agy-todo` updates the installed plugin in place.
 
-Antigravity 2.0 and the `agy` CLI both load plugins from `~/.gemini/config/plugins/`. In Antigravity 2.0, restart or reload the app if it was already open so it starts the `agy-todo` MCP server and `agy-todo/panel` sidecar. Open Skills & Customizations in the left sidebar to confirm AGY Todo is enabled, then open the AGY Todo tab in the Auxiliary Pane (or type `/todo` in chat).
+### Activate and verify
 
-If you use the `agy` CLI, you can validate and list the plugin from a terminal:
+- **Antigravity app:** Restart or reload the app if it was already open so it starts the `agy-todo` MCP server and `agy-todo/panel` sidecar (also reload/restart after updates). Open **Customizations** in the left sidebar to confirm **AGY Todo** is enabled, then open the **AGY Todo** tab in the Auxiliary Pane (or type `/todo` in chat).
+- **`agy` CLI:** Start a new session to load updated skills, or verify your installation from a terminal:
 
 ```bash
-agy plugin validate ~/.gemini/config/plugins/agy-todo
 agy plugin list
+agy plugin validate --strict ~/.gemini/config/plugins/agy-todo
+```
+
+You can also validate the repository directly before installing:
+
+```bash
+agy plugin validate --strict https://github.com/ankemp/agy-todo
 ```
 
 ## Layout
