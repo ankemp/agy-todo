@@ -458,3 +458,404 @@ test('computeLivePreviewSpecs handles empty docs, autolinks, angle-bracket links
   assert.equal(specs.some((s) => (s.kind === 'line' ? s.pos : s.from) >= fencedStart), false);
   assert.ok(buildDecorationSet(cm, specs).size > 0);
 });
+
+function applySpec(state, spec) {
+  assert.ok(spec && typeof spec === 'object', 'Expected non-null TransactionSpec');
+  return state.update(spec).state;
+}
+
+test('AGYNotesEditor exports Task 3 ergonomics helpers and keymap builder in browser global and CommonJS modes', () => {
+  const { browserGlobal, cjsExports } = loadNotesEditor();
+
+  for (const target of [browserGlobal, cjsExports]) {
+    assert.equal(typeof target.isSafeHttpUrl, 'function');
+    assert.equal(typeof target.isSelectionInRange, 'function');
+    assert.equal(typeof target.isSelectionOnLine, 'function');
+    assert.equal(typeof target.computeLivePreviewSpecs, 'function');
+    assert.equal(typeof target.computeSmartEnter, 'function');
+    assert.equal(typeof target.computeSmartTab, 'function');
+    assert.equal(typeof target.computeToggleInlineWrap, 'function');
+    assert.equal(typeof target.computeInsertLink, 'function');
+    assert.equal(typeof target.computeDelimiterWrap, 'function');
+    assert.equal(typeof target.computeToggleTask, 'function');
+    assert.equal(typeof target.createNotesKeymap, 'function');
+  }
+});
+
+test('computeSmartEnter continues tasks, bullets, ordered lists, blockquotes, exits empty prefixes, and returns null on plain lines', () => {
+  const { cm, editor } = loadEditorWithCmInContext();
+
+  // Task continuation resets checked state to unchecked and preserves indent/marker
+  const doneTaskState = createMarkdownState(cm, '- [x] Done', '- [x] Done'.length);
+  const doneTaskNext = applySpec(doneTaskState, editor.computeSmartEnter(doneTaskState));
+  assert.equal(doneTaskNext.doc.toString(), '- [x] Done\n- [ ] ');
+  assert.equal(doneTaskNext.selection.main.anchor, '- [x] Done\n- [ ] '.length);
+
+  const nestedTaskState = createMarkdownState(cm, '  * [X] Subtask', '  * [X] Subtask'.length);
+  const nestedTaskNext = applySpec(nestedTaskState, editor.computeSmartEnter(nestedTaskState));
+  assert.equal(nestedTaskNext.doc.toString(), '  * [X] Subtask\n  * [ ] ');
+
+  // Empty task clears line to exit list
+  const emptyTaskDoc = '# Notes\n  - [ ] ';
+  const emptyTaskState = createMarkdownState(cm, emptyTaskDoc, emptyTaskDoc.length);
+  const emptyTaskNext = applySpec(emptyTaskState, editor.computeSmartEnter(emptyTaskState));
+  assert.equal(emptyTaskNext.doc.toString(), '# Notes\n');
+  assert.equal(emptyTaskNext.selection.main.anchor, '# Notes\n'.length);
+
+  // Bullet continuation and exit
+  const bulletState = createMarkdownState(cm, '- Item', '- Item'.length);
+  const bulletNext = applySpec(bulletState, editor.computeSmartEnter(bulletState));
+  assert.equal(bulletNext.doc.toString(), '- Item\n- ');
+
+  const emptyBulletState = createMarkdownState(cm, '- ', 2);
+  const emptyBulletNext = applySpec(emptyBulletState, editor.computeSmartEnter(emptyBulletState));
+  assert.equal(emptyBulletNext.doc.toString(), '');
+  assert.equal(emptyBulletNext.selection.main.anchor, 0);
+
+  // Ordered list increments number and exits on empty
+  const orderedState = createMarkdownState(cm, '1. First', '1. First'.length);
+  const orderedNext = applySpec(orderedState, editor.computeSmartEnter(orderedState));
+  assert.equal(orderedNext.doc.toString(), '1. First\n2. ');
+
+  const parenOrderedState = createMarkdownState(cm, '9) Ninth', '9) Ninth'.length);
+  const parenOrderedNext = applySpec(parenOrderedState, editor.computeSmartEnter(parenOrderedState));
+  assert.equal(parenOrderedNext.doc.toString(), '9) Ninth\n10) ');
+
+  const emptyOrderedState = createMarkdownState(cm, '2. ', 3);
+  const emptyOrderedNext = applySpec(emptyOrderedState, editor.computeSmartEnter(emptyOrderedState));
+  assert.equal(emptyOrderedNext.doc.toString(), '');
+
+  // Blockquote continuation and exit
+  const quoteState = createMarkdownState(cm, '> Quote', '> Quote'.length);
+  const quoteNext = applySpec(quoteState, editor.computeSmartEnter(quoteState));
+  assert.equal(quoteNext.doc.toString(), '> Quote\n> ');
+
+  const emptyQuoteState = createMarkdownState(cm, '> ', 2);
+  const emptyQuoteNext = applySpec(emptyQuoteState, editor.computeSmartEnter(emptyQuoteState));
+  assert.equal(emptyQuoteNext.doc.toString(), '');
+
+  // Mid-line split preserves trailing text on new list item
+  const splitDoc = '- [ ] HelloWorld';
+  const splitState = createMarkdownState(cm, splitDoc, '- [ ] Hello'.length);
+  const splitNext = applySpec(splitState, editor.computeSmartEnter(splitState));
+  assert.equal(splitNext.doc.toString(), '- [ ] Hello\n- [ ] World');
+
+  // Plain lines, horizontal rules, cursor before prefix, and fenced code return null
+  assert.equal(editor.computeSmartEnter(createMarkdownState(cm, 'Hello', 5)), null);
+  assert.equal(editor.computeSmartEnter(createMarkdownState(cm, '- - -', 5)), null);
+  assert.equal(editor.computeSmartEnter(createMarkdownState(cm, '- Item', 0)), null);
+  const fencedDoc = '```md\n- inside code\n```';
+  assert.equal(editor.computeSmartEnter(createMarkdownState(cm, fencedDoc, fencedDoc.indexOf('code') + 4)), null);
+});
+
+test('computeSmartTab indents/outdents list lines and returns null on non-list lines for Tab focus traversal (Review Focus #5)', () => {
+  const { cm, editor } = loadEditorWithCmInContext();
+
+  // Bullet indent & outdent
+  const bulletState = createMarkdownState(cm, '- item', 0);
+  const indented = applySpec(bulletState, editor.computeSmartTab(bulletState, false));
+  assert.equal(indented.doc.toString(), '  - item');
+  assert.equal(indented.selection.main.anchor, 2);
+
+  const outdented = applySpec(indented, editor.computeSmartTab(indented, true));
+  assert.equal(outdented.doc.toString(), '- item');
+  assert.equal(outdented.selection.main.anchor, 0);
+
+  // Leading tab outdent and single-space outdent
+  const tabBulletState = createMarkdownState(cm, '\t- item', 3);
+  const tabOutdented = applySpec(tabBulletState, editor.computeSmartTab(tabBulletState, true));
+  assert.equal(tabOutdented.doc.toString(), '- item');
+  assert.equal(tabOutdented.selection.main.anchor, 2);
+
+  const oneSpaceState = createMarkdownState(cm, ' - item', 3);
+  const oneSpaceOutdented = applySpec(oneSpaceState, editor.computeSmartTab(oneSpaceState, true));
+  assert.equal(oneSpaceOutdented.doc.toString(), '- item');
+
+  // Nested task & ordered list
+  const taskState = createMarkdownState(cm, '  - [ ] task', '  - [ ] task'.length);
+  const indentedTask = applySpec(taskState, editor.computeSmartTab(taskState, false));
+  assert.equal(indentedTask.doc.toString(), '    - [ ] task');
+
+  const orderedState = createMarkdownState(cm, '1. item', 4);
+  const indentedOrdered = applySpec(orderedState, editor.computeSmartTab(orderedState, false));
+  assert.equal(indentedOrdered.doc.toString(), '  1. item');
+
+  // Multi-line list selection
+  const multiDoc = '- one\n- two';
+  const multiState = createMarkdownState(cm, multiDoc, 0, multiDoc.length);
+  const multiIndented = applySpec(multiState, editor.computeSmartTab(multiState, false));
+  assert.equal(multiIndented.doc.toString(), '  - one\n  - two');
+
+  // Outdent at column 0 has nothing to outdent -> null
+  assert.equal(editor.computeSmartTab(createMarkdownState(cm, '- item', 2), true), null);
+
+  // Non-list lines return null so Tab / Shift-Tab moves focus outside editor naturally
+  assert.equal(editor.computeSmartTab(createMarkdownState(cm, 'Hello world', 5), false), null);
+  assert.equal(editor.computeSmartTab(createMarkdownState(cm, 'Hello world', 5), true), null);
+  assert.equal(editor.computeSmartTab(createMarkdownState(cm, '', 0), false), null);
+  assert.equal(editor.computeSmartTab(createMarkdownState(cm, '> quote', 4), false), null);
+  assert.equal(editor.computeSmartTab(createMarkdownState(cm, '---', 3), false), null);
+});
+
+test('computeToggleInlineWrap wraps/unwraps selections and centers empty cursor for **, *, and `', () => {
+  const { cm, editor } = loadEditorWithCmInContext();
+
+  for (const marker of ['**', '*', '`']) {
+    const startState = createMarkdownState(cm, 'hello', 0, 5);
+    const wrapped = applySpec(startState, editor.computeToggleInlineWrap(startState, marker));
+    assert.equal(wrapped.doc.toString(), `${marker}hello${marker}`);
+    assert.equal(wrapped.doc.sliceString(wrapped.selection.main.from, wrapped.selection.main.to), 'hello');
+
+    const unwrapped = applySpec(wrapped, editor.computeToggleInlineWrap(wrapped, marker));
+    assert.equal(unwrapped.doc.toString(), 'hello');
+    assert.equal(unwrapped.selection.main.from, 0);
+    assert.equal(unwrapped.selection.main.to, 5);
+  }
+
+  // Unwrapping when delimiters are included inside the selection
+  const fullSelected = createMarkdownState(cm, '**hello**', 0, 9);
+  const fullUnwrapped = applySpec(fullSelected, editor.computeToggleInlineWrap(fullSelected, '**'));
+  assert.equal(fullUnwrapped.doc.toString(), 'hello');
+  assert.equal(fullUnwrapped.selection.main.from, 0);
+  assert.equal(fullUnwrapped.selection.main.to, 5);
+
+  // Applying italic * onto bold **hello** adds ***hello*** instead of breaking **
+  const boldInner = createMarkdownState(cm, '**hello**', 2, 7);
+  const boldItalic = applySpec(boldInner, editor.computeToggleInlineWrap(boldInner, '*'));
+  assert.equal(boldItalic.doc.toString(), '***hello***');
+  const backToBold = applySpec(boldItalic, editor.computeToggleInlineWrap(boldItalic, '*'));
+  assert.equal(backToBold.doc.toString(), '**hello**');
+
+  // Empty selection centers cursor between markers
+  const emptyState = createMarkdownState(cm, 'ab', 1);
+  const emptyWrapped = applySpec(emptyState, editor.computeToggleInlineWrap(emptyState, '*'));
+  assert.equal(emptyWrapped.doc.toString(), 'a**b');
+  assert.equal(emptyWrapped.selection.main.anchor, 2);
+});
+
+test('computeInsertLink handles text selection, safe http(s) URL selection, unsafe schemes, and empty cursor', () => {
+  const { cm, editor } = loadEditorWithCmInContext();
+
+  const textDoc = 'Read Docs now';
+  const textState = createMarkdownState(cm, textDoc, textDoc.indexOf('Docs'), textDoc.indexOf('Docs') + 4);
+  const textLinked = applySpec(textState, editor.computeInsertLink(textState));
+  assert.equal(textLinked.doc.toString(), 'Read [Docs](url) now');
+  assert.equal(textLinked.doc.sliceString(textLinked.selection.main.from, textLinked.selection.main.to), 'url');
+
+  const urlDoc = 'https://example.com';
+  const urlState = createMarkdownState(cm, urlDoc, 0, urlDoc.length);
+  const urlLinked = applySpec(urlState, editor.computeInsertLink(urlState));
+  assert.equal(urlLinked.doc.toString(), '[](https://example.com)');
+  assert.equal(urlLinked.selection.main.empty, true);
+  assert.equal(urlLinked.selection.main.anchor, 1);
+
+  // Unsafe URL is treated as link text rather than a URL
+  const unsafeDoc = 'javascript:alert(1)';
+  const unsafeState = createMarkdownState(cm, unsafeDoc, 0, unsafeDoc.length);
+  const unsafeLinked = applySpec(unsafeState, editor.computeInsertLink(unsafeState));
+  assert.equal(unsafeLinked.doc.toString(), '[javascript:alert(1)](url)');
+  assert.equal(unsafeLinked.doc.sliceString(unsafeLinked.selection.main.from, unsafeLinked.selection.main.to), 'url');
+
+  // Empty selection places cursor inside []
+  const emptyState = createMarkdownState(cm, 'ab', 1);
+  const emptyLinked = applySpec(emptyState, editor.computeInsertLink(emptyState));
+  assert.equal(emptyLinked.doc.toString(), 'a[](url)b');
+  assert.equal(emptyLinked.selection.main.empty, true);
+  assert.equal(emptyLinked.selection.main.anchor, 2);
+});
+
+test('computeDelimiterWrap wraps non-empty selections on *, _, `, ~, [ and returns null otherwise', () => {
+  const { cm, editor } = loadEditorWithCmInContext();
+  const baseDoc = 'a word b';
+  const from = baseDoc.indexOf('word');
+  const to = from + 4;
+  const state = createMarkdownState(cm, baseDoc, from, to);
+
+  for (const [open, close] of [['*', '*'], ['_', '_'], ['`', '`'], ['~', '~'], ['[', ']']]) {
+    const next = applySpec(state, editor.computeDelimiterWrap(state, from, to, open));
+    assert.equal(next.doc.toString(), `a ${open}word${close} b`);
+    assert.equal(next.doc.sliceString(next.selection.main.from, next.selection.main.to), 'word');
+  }
+
+  assert.equal(editor.computeDelimiterWrap(state, from, from, '*'), null);
+  assert.equal(editor.computeDelimiterWrap(state, from, to, 'a'), null);
+  assert.equal(editor.computeDelimiterWrap(state, from, to, '**'), null);
+});
+
+test('computeToggleTask toggles [ ], [x], [X] markers and ignores non-task ranges or read-only states', () => {
+  const { cm, editor } = loadEditorWithCmInContext();
+
+  const openState = createMarkdownState(cm, '- [ ] Buy milk', 10);
+  const checked = applySpec(openState, editor.computeToggleTask(openState, 0, 5));
+  assert.equal(checked.doc.toString(), '- [x] Buy milk');
+  assert.equal(checked.selection.main.anchor, 10);
+
+  const unchecked = applySpec(checked, editor.computeToggleTask(checked, 2, 5));
+  assert.equal(unchecked.doc.toString(), '- [ ] Buy milk');
+
+  const upperState = createMarkdownState(cm, '* [X] Done', 0);
+  const upperUnchecked = applySpec(upperState, editor.computeToggleTask(upperState, 0, 5));
+  assert.equal(upperUnchecked.doc.toString(), '* [ ] Done');
+
+  const nonTaskState = createMarkdownState(cm, '- Plain item', 0);
+  assert.equal(editor.computeToggleTask(nonTaskState, 0, 2), null);
+  assert.equal(editor.computeToggleTask(nonTaskState, 0, 99), null);
+
+  const readOnlyState = cm.EditorState.create({
+    doc: '- [ ] Locked',
+    extensions: [cm.EditorState.readOnly.of(true)],
+  });
+  assert.equal(editor.computeToggleTask(readOnlyState, 0, 5), null);
+});
+
+test('createNotesKeymap binds all 7 Obsidian chords and prevents Hub forwarding on claimed modifier chords when editable (Review Focus #5)', () => {
+  const { cm, editor } = loadEditorWithCmInContext();
+
+  // 1. Real CM6 state acceptance & high-precedence registered bindings
+  const realExt = editor.createNotesKeymap(cm);
+  const realState = cm.EditorState.create({
+    doc: '- item',
+    extensions: [cm.markdown({ extensions: [cm.Strikethrough, cm.TaskList, cm.Autolink] }), realExt],
+  });
+  const keymapLayers = realState.facet(cm.keymap);
+  assert.ok(keymapLayers.length >= 1);
+  const boundKeys = keymapLayers[0].map((b) => b.key);
+  assert.deepEqual(toPlain(boundKeys), ['Enter', 'Tab', 'Shift-Tab', 'Mod-b', 'Mod-i', 'Mod-`', 'Mod-k']);
+
+  // 2. Instrumented CM6 wrapper to exercise keymap run() handlers and domEventHandlers keydown guard
+  let capturedBindings = null;
+  let capturedPrec = null;
+  let capturedDomHandlers = null;
+  const spyCm = {
+    ...cm,
+    Prec: {
+      ...cm.Prec,
+      highest(ext) {
+        capturedPrec = 'highest';
+        return cm.Prec.highest(ext);
+      },
+    },
+    keymap: {
+      ...cm.keymap,
+      of(bindings) {
+        capturedBindings = bindings;
+        return cm.keymap.of(bindings);
+      },
+    },
+    EditorView: {
+      ...cm.EditorView,
+      domEventHandlers(handlers) {
+        capturedDomHandlers = handlers;
+        return cm.EditorView.domEventHandlers(handlers);
+      },
+    },
+  };
+
+  editor.createNotesKeymap(spyCm);
+  assert.equal(capturedPrec, 'highest');
+  assert.ok(Array.isArray(capturedBindings));
+  assert.equal(typeof capturedDomHandlers?.keydown, 'function');
+
+  const byKey = new Map(capturedBindings.map((b) => [b.key, b]));
+  const makeView = (doc, anchor, head = anchor, extraExts = []) => {
+    const view = {
+      state: cm.EditorState.create({
+        doc,
+        selection: { anchor, head },
+        extensions: [cm.markdown({ extensions: [cm.Strikethrough, cm.TaskList, cm.Autolink] }), ...extraExts],
+      }),
+      dispatched: 0,
+      dispatch(spec) {
+        view.dispatched += 1;
+        view.state = view.state.update(spec).state;
+      },
+    };
+    return view;
+  };
+
+  // Enter & Tab passthrough vs handled
+  const plainView = makeView('plain', 5);
+  assert.equal(byKey.get('Enter').run(plainView), false);
+  assert.equal(byKey.get('Tab').run(plainView), false);
+  assert.equal(byKey.get('Shift-Tab').run(plainView), false);
+  assert.equal(plainView.dispatched, 0);
+
+  const listView = makeView('- item', 6);
+  assert.equal(byKey.get('Tab').run(listView), true);
+  assert.equal(listView.state.doc.toString(), '  - item');
+  assert.equal(byKey.get('Shift-Tab').run(listView), true);
+  assert.equal(listView.state.doc.toString(), '- item');
+  assert.equal(byKey.get('Enter').run(listView), true);
+  assert.equal(listView.state.doc.toString(), '- item\n- ');
+
+  // Mod-b, Mod-i, Mod-`, Mod-k
+  const fmtView = makeView('word', 0, 4);
+  assert.equal(byKey.get('Mod-b').run(fmtView), true);
+  assert.equal(fmtView.state.doc.toString(), '**word**');
+
+  const italicView = makeView('word', 0, 4);
+  assert.equal(byKey.get('Mod-i').run(italicView), true);
+  assert.equal(italicView.state.doc.toString(), '*word*');
+
+  const codeView = makeView('word', 0, 4);
+  assert.equal(byKey.get('Mod-`').run(codeView), true);
+  assert.equal(codeView.state.doc.toString(), '`word`');
+
+  const linkView = makeView('Docs', 0, 4);
+  assert.equal(byKey.get('Mod-k').run(linkView), true);
+  assert.equal(linkView.state.doc.toString(), '[Docs](url)');
+
+  // domEventHandlers keydown guard prevents default for claimed Mod chords when editable (and returns false so keymap runs)
+  const makeEvent = (overrides) => ({
+    key: '',
+    code: '',
+    metaKey: false,
+    ctrlKey: false,
+    altKey: false,
+    shiftKey: false,
+    defaultPrevented: false,
+    preventDefault() {
+      this.defaultPrevented = true;
+    },
+    ...overrides,
+  });
+
+  for (const chord of [
+    { key: 'b', metaKey: true },
+    { key: 'i', metaKey: true },
+    { key: '`', metaKey: true },
+    { key: 'k', metaKey: true },
+    { key: 'k', ctrlKey: true },
+    { key: 'Dead', code: 'Backquote', metaKey: true },
+  ]) {
+    const ev = makeEvent(chord);
+    const handled = capturedDomHandlers.keydown(ev, fmtView);
+    assert.equal(ev.defaultPrevented, true, `Expected preventDefault() for ${JSON.stringify(chord)}`);
+    assert.equal(Boolean(handled), false, 'Expected domEventHandlers to allow keymap execution');
+  }
+
+  // Non-claimed chords must NOT call preventDefault()
+  for (const ignored of [
+    { key: 'c', metaKey: true },
+    { key: 'z', metaKey: true },
+    { key: 'b', metaKey: false, ctrlKey: false },
+    { key: 'b', metaKey: true, shiftKey: true },
+    { key: 'b', metaKey: true, altKey: true },
+  ]) {
+    const ev = makeEvent(ignored);
+    capturedDomHandlers.keydown(ev, fmtView);
+    assert.equal(ev.defaultPrevented, false, `Did not expect preventDefault() for ${JSON.stringify(ignored)}`);
+  }
+
+  // Disabled / read-only views must block both domEventHandlers prevention and keymap mutations
+  const readOnlyView = makeView('word', 0, 4, [cm.EditorState.readOnly.of(true)]);
+  const nonEditableView = makeView('word', 0, 4, [cm.EditorView.editable.of(false)]);
+  for (const lockedView of [readOnlyView, nonEditableView]) {
+    const ev = makeEvent({ key: 'b', metaKey: true });
+    capturedDomHandlers.keydown(ev, lockedView);
+    assert.equal(ev.defaultPrevented, false);
+    assert.equal(byKey.get('Mod-b').run(lockedView), false);
+    assert.equal(byKey.get('Enter').run(lockedView), false);
+    assert.equal(lockedView.dispatched, 0);
+  }
+});

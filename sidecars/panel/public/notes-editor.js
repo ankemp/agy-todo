@@ -727,10 +727,558 @@
     return specs;
   }
 
+  var DELIMITER_PAIRS = {
+    '*': '*',
+    '_': '_',
+    '`': '`',
+    '~': '~',
+    '[': ']',
+  };
+
+  var CLAIMED_MOD_KEYS = {
+    b: true,
+    i: true,
+    k: true,
+    '`': true,
+  };
+
+  function isHorizontalRuleLine(text) {
+    return /^[ \t]*([-*_])(?:[ \t]*\1){2,}[ \t]*$/.test(text);
+  }
+
+  function isInFencedCode(state, pos) {
+    var resolvedCm = resolveCodeMirror();
+    if (!resolvedCm || typeof resolvedCm.syntaxTree !== 'function') {
+      return false;
+    }
+    var tree = resolvedCm.syntaxTree(state);
+    if (!tree || typeof tree.resolveInner !== 'function') {
+      return false;
+    }
+    var node = tree.resolveInner(pos, -1);
+    while (node) {
+      if (node.name === 'FencedCode') {
+        return true;
+      }
+      node = node.parent;
+    }
+    return false;
+  }
+
+  function isEditorEditable(state, cm) {
+    if (!state || state.readOnly) {
+      return false;
+    }
+    var resolvedCm = resolveCodeMirror(cm);
+    if (resolvedCm && resolvedCm.EditorView && resolvedCm.EditorView.editable && typeof state.facet === 'function') {
+      return state.facet(resolvedCm.EditorView.editable) !== false;
+    }
+    return true;
+  }
+
+  function makeOrientedSelection(range, from, to) {
+    if (range && range.anchor > range.head) {
+      return { anchor: to, head: from };
+    }
+    return { anchor: from, head: to };
+  }
+
+  function matchListOrTaskPrefix(text) {
+    if (isHorizontalRuleLine(text)) {
+      return null;
+    }
+    var taskMatch = text.match(/^([ \t]*)([-*+])[ \t]+\[[ xX]\](?:[ \t]+|$)/);
+    if (taskMatch) {
+      return {
+        kind: 'task',
+        prefixLen: taskMatch[0].length,
+        nextPrefix: taskMatch[1] + taskMatch[2] + ' [ ] ',
+      };
+    }
+    var bulletMatch = text.match(/^([ \t]*)([-*+])[ \t]+/);
+    if (bulletMatch) {
+      return {
+        kind: 'bullet',
+        prefixLen: bulletMatch[0].length,
+        nextPrefix: bulletMatch[1] + bulletMatch[2] + ' ',
+      };
+    }
+    var orderedMatch = text.match(/^([ \t]*)(\d+)([.)])[ \t]+/);
+    if (orderedMatch) {
+      var nextNum = parseInt(orderedMatch[2], 10) + 1;
+      return {
+        kind: 'ordered',
+        prefixLen: orderedMatch[0].length,
+        nextPrefix: orderedMatch[1] + String(nextNum) + orderedMatch[3] + ' ',
+      };
+    }
+    return null;
+  }
+
+  function buildInsertContinuationSpec(range, insertion) {
+    return {
+      changes: { from: range.from, to: range.to, insert: insertion },
+      selection: { anchor: range.from + insertion.length },
+      scrollIntoView: true,
+      userEvent: 'input',
+    };
+  }
+
+  function buildClearRangeSpec(from, to) {
+    return {
+      changes: { from: from, to: to, insert: '' },
+      selection: { anchor: from },
+      scrollIntoView: true,
+      userEvent: 'delete',
+    };
+  }
+
+  /**
+   * Computes smart list / task / blockquote continuation or empty-prefix exit on Enter.
+   * Returns null for plain lines, fenced code, multi-line selections, or cursor before prefix.
+   * @param {object} state
+   * @returns {object | null}
+   */
+  function computeSmartEnter(state) {
+    if (!state || !state.doc || !state.selection || state.selection.ranges.length !== 1) {
+      return null;
+    }
+    var range = state.selection.main;
+    var line = state.doc.lineAt(range.from);
+    if (range.to > line.to || isInFencedCode(state, range.from)) {
+      return null;
+    }
+
+    var offset = range.from - line.from;
+    var text = line.text;
+
+    var quoteMatch = text.match(/^([ \t]*(?:>[ \t]?)+)/);
+    if (quoteMatch) {
+      var quotePrefix = quoteMatch[1];
+      if (offset < quotePrefix.length) {
+        return null;
+      }
+      var innerText = text.slice(quotePrefix.length);
+      var innerList = matchListOrTaskPrefix(innerText);
+      if (innerList) {
+        var listOffset = offset - quotePrefix.length;
+        if (listOffset < innerList.prefixLen) {
+          return null;
+        }
+        if (innerText.slice(innerList.prefixLen).trim() === '') {
+          return buildClearRangeSpec(line.from + quotePrefix.length, line.to);
+        }
+        return buildInsertContinuationSpec(range, '\n' + quotePrefix + innerList.nextPrefix);
+      }
+      if (innerText.trim() === '') {
+        return buildClearRangeSpec(line.from, line.to);
+      }
+      var lastCh = quotePrefix.charAt(quotePrefix.length - 1);
+      var normalizedQuote = isHorizontalWhitespace(lastCh) ? quotePrefix : quotePrefix + ' ';
+      return buildInsertContinuationSpec(range, '\n' + normalizedQuote);
+    }
+
+    var listInfo = matchListOrTaskPrefix(text);
+    if (!listInfo || offset < listInfo.prefixLen) {
+      return null;
+    }
+    if (text.slice(listInfo.prefixLen).trim() === '') {
+      return buildClearRangeSpec(line.from, line.to);
+    }
+    return buildInsertContinuationSpec(range, '\n' + listInfo.nextPrefix);
+  }
+
+  /**
+   * Indents or outdents list lines (bullet, ordered, task) by 2 spaces (or leading tab).
+   * Returns null outside list lines so Tab / Shift-Tab lets focus escape the editor naturally.
+   * @param {object} state
+   * @param {boolean} [outdent]
+   * @returns {object | null}
+   */
+  function computeSmartTab(state, outdent) {
+    if (!state || !state.doc || !state.selection) {
+      return null;
+    }
+    var range = state.selection.main;
+    var startLineNum = state.doc.lineAt(range.from).number;
+    var endLineNum = state.doc.lineAt(range.to).number;
+    if (!range.empty && endLineNum > startLineNum && range.to === state.doc.line(endLineNum).from) {
+      endLineNum -= 1;
+    }
+
+    var listLines = [];
+    for (var ln = startLineNum; ln <= endLineNum; ln += 1) {
+      var line = state.doc.line(ln);
+      if (isInFencedCode(state, line.from)) {
+        return null;
+      }
+      if (matchListOrTaskPrefix(line.text)) {
+        listLines.push(line);
+      } else if (startLineNum === endLineNum || line.text.trim() !== '') {
+        return null;
+      }
+    }
+
+    if (listLines.length === 0) {
+      return null;
+    }
+
+    var changes = [];
+    for (var i = 0; i < listLines.length; i += 1) {
+      var targetLine = listLines[i];
+      if (!outdent) {
+        changes.push({ from: targetLine.from, to: targetLine.from, insert: '  ' });
+      } else if (targetLine.text.charAt(0) === '\t') {
+        changes.push({ from: targetLine.from, to: targetLine.from + 1, insert: '' });
+      } else if (targetLine.text.slice(0, 2) === '  ') {
+        changes.push({ from: targetLine.from, to: targetLine.from + 2, insert: '' });
+      } else if (targetLine.text.charAt(0) === ' ') {
+        changes.push({ from: targetLine.from, to: targetLine.from + 1, insert: '' });
+      }
+    }
+
+    if (changes.length === 0) {
+      return null;
+    }
+
+    var changeSet = state.changes(changes);
+    return {
+      changes: changes,
+      selection: state.selection.map(changeSet, outdent ? -1 : 1),
+      scrollIntoView: true,
+      userEvent: outdent ? 'delete' : 'input',
+    };
+  }
+
+  function countContiguousChars(docSliceFn, startPos, step, ch, limit) {
+    var count = 0;
+    var pos = startPos;
+    while (pos >= 0 && pos < limit) {
+      var nextPos = step > 0 ? pos : pos - 1;
+      if (nextPos < 0 || nextPos + 1 > limit || docSliceFn(nextPos, nextPos + 1) !== ch) {
+        break;
+      }
+      count += 1;
+      pos += step;
+    }
+    return count;
+  }
+
+  function hasBalancedSingleStarOutside(state, from, to) {
+    var docLen = state.doc.length;
+    var slice = function (a, b) {
+      return state.sliceDoc(a, b);
+    };
+    var beforeCount = countContiguousChars(slice, from, -1, '*', docLen);
+    var afterCount = countContiguousChars(slice, to, 1, '*', docLen);
+    // Avoid misclassifying **bold** delimiters (2 stars) as *italic* wrappers.
+    return (beforeCount % 2 === 1) && (afterCount % 2 === 1);
+  }
+
+  /**
+   * Toggles inline Markdown delimiter wrapping (**, *, `, etc.) around the selection
+   * or inserts a centered empty delimiter pair at a collapsed cursor.
+   * @param {object} state
+   * @param {string} marker
+   * @returns {object}
+   */
+  function computeToggleInlineWrap(state, marker) {
+    if (!state || !state.doc || !state.selection || typeof marker !== 'string' || !marker) {
+      return { changes: [] };
+    }
+    var range = state.selection.main;
+    var mLen = marker.length;
+
+    if (range.empty) {
+      return {
+        changes: { from: range.from, to: range.to, insert: marker + marker },
+        selection: { anchor: range.from + mLen },
+        scrollIntoView: true,
+        userEvent: 'input',
+      };
+    }
+
+    var from = range.from;
+    var to = range.to;
+    var docLen = state.doc.length;
+
+    var hasOutside =
+      from >= mLen &&
+      to + mLen <= docLen &&
+      state.sliceDoc(from - mLen, from) === marker &&
+      state.sliceDoc(to, to + mLen) === marker &&
+      (marker !== '*' || hasBalancedSingleStarOutside(state, from, to));
+
+    if (hasOutside) {
+      return {
+        changes: [
+          { from: from - mLen, to: from, insert: '' },
+          { from: to, to: to + mLen, insert: '' },
+        ],
+        selection: makeOrientedSelection(range, from - mLen, to - mLen),
+        scrollIntoView: true,
+        userEvent: 'delete',
+      };
+    }
+
+    var selected = state.sliceDoc(from, to);
+    if (selected.length >= mLen * 2 && selected.slice(0, mLen) === marker && selected.slice(selected.length - mLen) === marker) {
+      var canUnwrapInside = false;
+      if (marker === '*') {
+        var lead = 0;
+        var trail = 0;
+        while (lead < selected.length && selected.charAt(lead) === '*') lead += 1;
+        while (trail < selected.length && selected.charAt(selected.length - 1 - trail) === '*') trail += 1;
+        canUnwrapInside =
+          (lead % 2 === 1) &&
+          (trail % 2 === 1) &&
+          lead + trail <= selected.length &&
+          selected.slice(lead, selected.length - trail).indexOf('*') === -1;
+      } else {
+        canUnwrapInside = selected.slice(mLen, selected.length - mLen).indexOf(marker) === -1;
+      }
+
+      if (canUnwrapInside) {
+        return {
+          changes: [
+            { from: from, to: from + mLen, insert: '' },
+            { from: to - mLen, to: to, insert: '' },
+          ],
+          selection: makeOrientedSelection(range, from, to - mLen * 2),
+          scrollIntoView: true,
+          userEvent: 'delete',
+        };
+      }
+    }
+
+    return {
+      changes: [
+        { from: from, to: from, insert: marker },
+        { from: to, to: to, insert: marker },
+      ],
+      selection: makeOrientedSelection(range, from + mLen, to + mLen),
+      scrollIntoView: true,
+      userEvent: 'input',
+    };
+  }
+
+  /**
+   * Inserts a Markdown link template based on selection:
+   * - safe http(s) URL -> `[](url)` with cursor inside `[]`
+   * - non-URL text -> `[text](url)` with `url` selected
+   * - empty selection -> `[](url)` with cursor inside `[]`
+   * @param {object} state
+   * @returns {object}
+   */
+  function computeInsertLink(state) {
+    if (!state || !state.doc || !state.selection) {
+      return { changes: [] };
+    }
+    var range = state.selection.main;
+    var from = range.from;
+    var to = range.to;
+
+    if (range.empty) {
+      return {
+        changes: { from: from, to: to, insert: '[](url)' },
+        selection: { anchor: from + 1 },
+        scrollIntoView: true,
+        userEvent: 'input',
+      };
+    }
+
+    var selected = state.sliceDoc(from, to);
+    if (isSafeHttpUrl(selected)) {
+      var cleanUrl = selected.trim();
+      return {
+        changes: { from: from, to: to, insert: '[](' + cleanUrl + ')' },
+        selection: { anchor: from + 1 },
+        scrollIntoView: true,
+        userEvent: 'input',
+      };
+    }
+
+    var inserted = '[' + selected + '](url)';
+    var urlStart = from + 1 + selected.length + 2;
+    return {
+      changes: { from: from, to: to, insert: inserted },
+      selection: { anchor: urlStart, head: urlStart + 3 },
+      scrollIntoView: true,
+      userEvent: 'input',
+    };
+  }
+
+  /**
+   * Wraps a non-empty selection when typing *, _, `, ~, or [ (closing with ]).
+   * Returns null on empty selection, invalid range, or non-delimiter text.
+   * @param {object} state
+   * @param {number} from
+   * @param {number} to
+   * @param {string} text
+   * @returns {object | null}
+   */
+  function computeDelimiterWrap(state, from, to, text) {
+    if (
+      !state ||
+      !state.doc ||
+      typeof from !== 'number' ||
+      typeof to !== 'number' ||
+      from < 0 ||
+      to > state.doc.length ||
+      from >= to ||
+      typeof text !== 'string' ||
+      !Object.prototype.hasOwnProperty.call(DELIMITER_PAIRS, text)
+    ) {
+      return null;
+    }
+
+    var close = DELIMITER_PAIRS[text];
+    var main = state.selection ? state.selection.main : null;
+    var sel = main && main.from === from && main.to === to
+      ? makeOrientedSelection(main, from + 1, to + 1)
+      : { anchor: from + 1, head: to + 1 };
+
+    return {
+      changes: [
+        { from: from, to: from, insert: text },
+        { from: to, to: to, insert: close },
+      ],
+      selection: sel,
+      scrollIntoView: true,
+      userEvent: 'input',
+    };
+  }
+
+  /**
+   * Toggles a Markdown task checkbox marker (`[ ]` <-> `[x]`, `[X]` -> `[ ]`).
+   * Accepts either the 3-char bracket range `[ ]` or full list+task prefix `- [ ]`.
+   * @param {object} state
+   * @param {number} markerFrom
+   * @param {number} markerTo
+   * @returns {object | null}
+   */
+  function computeToggleTask(state, markerFrom, markerTo) {
+    if (
+      !isEditorEditable(state) ||
+      !state.doc ||
+      typeof markerFrom !== 'number' ||
+      typeof markerTo !== 'number' ||
+      markerFrom < 0 ||
+      markerTo > state.doc.length ||
+      markerFrom >= markerTo
+    ) {
+      return null;
+    }
+
+    var slice = state.sliceDoc(markerFrom, markerTo);
+    var bracketFrom = -1;
+    var bracketText = '';
+
+    if (/^\[[ xX]\]$/.test(slice)) {
+      bracketFrom = markerFrom;
+      bracketText = slice;
+    } else {
+      var prefixMatch = slice.match(/^[-*+][ \t]+(\[[ xX]\])$/);
+      if (prefixMatch) {
+        bracketText = prefixMatch[1];
+        bracketFrom = markerTo - 3;
+      }
+    }
+
+    if (bracketFrom < 0) {
+      return null;
+    }
+
+    var nextChar = bracketText === '[ ]' ? 'x' : ' ';
+    return {
+      changes: { from: bracketFrom + 1, to: bracketFrom + 2, insert: nextChar },
+      userEvent: 'input',
+    };
+  }
+
+  function isClaimedModShortcut(event) {
+    if (!event || event.altKey || event.shiftKey) {
+      return false;
+    }
+    var hasMod;
+    if (typeof navigator !== 'undefined' && typeof navigator.platform === 'string') {
+      var isMac = /Mac|iPod|iPhone|iPad/i.test(navigator.platform);
+      hasMod = isMac ? (Boolean(event.metaKey) && !event.ctrlKey) : (Boolean(event.ctrlKey) && !event.metaKey);
+    } else {
+      hasMod = Boolean(event.metaKey) !== Boolean(event.ctrlKey);
+    }
+    if (!hasMod) {
+      return false;
+    }
+    var key = typeof event.key === 'string' ? event.key.toLowerCase() : '';
+    return Object.prototype.hasOwnProperty.call(CLAIMED_MOD_KEYS, key) || event.code === 'Backquote';
+  }
+
+  function makeCommandHandler(resolvedCm, computeFn) {
+    return function (view) {
+      if (!view || !isEditorEditable(view.state, resolvedCm)) {
+        return false;
+      }
+      var spec = computeFn(view.state);
+      if (!spec) {
+        return false;
+      }
+      view.dispatch(spec);
+      return true;
+    };
+  }
+
+  /**
+   * Builds the high-precedence Obsidian keymap extension and pre-bubble keydown guard
+   * preventing /preload.js from forwarding claimed modifier chords to the AGY Hub.
+   * @param {object} [cm]
+   * @returns {Array<object>}
+   */
+  function createNotesKeymap(cm) {
+    var resolvedCm = resolveCodeMirror(cm);
+    if (!resolvedCm || !resolvedCm.keymap || !resolvedCm.Prec || !resolvedCm.EditorView) {
+      return [];
+    }
+
+    var bindings = [
+      { key: 'Enter', run: makeCommandHandler(resolvedCm, computeSmartEnter) },
+      { key: 'Tab', run: makeCommandHandler(resolvedCm, function (s) { return computeSmartTab(s, false); }) },
+      { key: 'Shift-Tab', run: makeCommandHandler(resolvedCm, function (s) { return computeSmartTab(s, true); }) },
+      { key: 'Mod-b', run: makeCommandHandler(resolvedCm, function (s) { return computeToggleInlineWrap(s, '**'); }) },
+      { key: 'Mod-i', run: makeCommandHandler(resolvedCm, function (s) { return computeToggleInlineWrap(s, '*'); }) },
+      { key: 'Mod-`', run: makeCommandHandler(resolvedCm, function (s) { return computeToggleInlineWrap(s, '`'); }) },
+      { key: 'Mod-k', run: makeCommandHandler(resolvedCm, computeInsertLink) },
+    ];
+
+    // @codemirror/lang-markdown registers its own Enter binding at Prec.high; Prec.highest
+    // ensures our smart list/task Enter and Tab passthrough run first regardless of extension order.
+    var extensions = [resolvedCm.Prec.highest(resolvedCm.keymap.of(bindings))];
+    if (typeof resolvedCm.EditorView.domEventHandlers === 'function') {
+      extensions.push(resolvedCm.EditorView.domEventHandlers({
+        keydown: function (event, view) {
+          if (view && isEditorEditable(view.state, resolvedCm) && isClaimedModShortcut(event)) {
+            if (typeof event.preventDefault === 'function') {
+              event.preventDefault();
+            }
+          }
+          return false;
+        },
+      }));
+    }
+    return extensions;
+  }
+
   return {
     isSafeHttpUrl: isSafeHttpUrl,
     isSelectionInRange: isSelectionInRange,
     isSelectionOnLine: isSelectionOnLine,
     computeLivePreviewSpecs: computeLivePreviewSpecs,
+    computeSmartEnter: computeSmartEnter,
+    computeSmartTab: computeSmartTab,
+    computeToggleInlineWrap: computeToggleInlineWrap,
+    computeInsertLink: computeInsertLink,
+    computeDelimiterWrap: computeDelimiterWrap,
+    computeToggleTask: computeToggleTask,
+    createNotesKeymap: createNotesKeymap,
   };
 });
