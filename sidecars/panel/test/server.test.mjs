@@ -174,6 +174,8 @@ test('standalone mode serves static assets and /preload.js with accurate MIME ty
     { path: '/styles.css', contentType: 'text/css', snippet: '.app-shell' },
     { path: '/app.js', contentType: 'application/javascript', snippet: '/api/scratchpad' },
     { path: '/helpers.js', contentType: 'application/javascript', snippet: 'createNotesAutosaver' },
+    { path: '/vendor/cm6-bundle.js', contentType: 'application/javascript; charset=utf-8', snippet: 'AGYCodeMirror' },
+    { path: '/notes-editor.js', contentType: 'application/javascript; charset=utf-8', snippet: 'AGYNotesEditor' },
     { path: '/preload.js', contentType: 'application/javascript', snippet: 'window.sidecar' },
   ];
 
@@ -467,6 +469,16 @@ test('SidecarApp mode serves MIME types, persists scratchpad, and maps 400/404 e
   const helpersRes = await fetch(`${baseUrl}/helpers.js`);
   assert.equal(helpersRes.status, 200);
   assert.ok((helpersRes.headers.get('content-type') || '').includes('application/javascript'));
+
+  const vendorRes = await fetch(`${baseUrl}/vendor/cm6-bundle.js`);
+  assert.equal(vendorRes.status, 200);
+  assert.equal(vendorRes.headers.get('content-type'), 'application/javascript; charset=utf-8');
+  assert.ok((await vendorRes.text()).includes('AGYCodeMirror'));
+
+  const notesEditorRes = await fetch(`${baseUrl}/notes-editor.js`);
+  assert.equal(notesEditorRes.status, 200);
+  assert.equal(notesEditorRes.headers.get('content-type'), 'application/javascript; charset=utf-8');
+  assert.ok((await notesEditorRes.text()).includes('AGYNotesEditor'));
 
   // CRUD smoke test in SidecarApp mode
   const addRes = await postJson(baseUrl, '/api/todos/add', {
