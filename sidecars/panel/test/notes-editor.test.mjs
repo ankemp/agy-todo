@@ -1774,3 +1774,28 @@ test('buildEditorExtensions domEventHandlers wire Mod+Click link opening and ext
   assert.equal(viewHandlers.mousedown({ target: linkSpan, metaKey: true, button: 0, preventDefault() {} }), true);
   assert.deepEqual(opened, ['https://example.com']);
 });
+
+test('buildModeExtension source HighlightStyle dims list/task markers without dimming list text or links', () => {
+  const { cm, editor } = loadEditorWithCmInContext();
+  const sourceExts = editor.buildModeExtension('source', cm);
+  assert.ok(Array.isArray(sourceExts));
+
+  const styleExt = sourceExts.find((entry) => entry?.value && Array.isArray(entry.value.specs) && typeof entry.value.style === 'function');
+  assert.ok(styleExt, 'Expected HighlightStyle extension in source mode');
+
+  const highlighter = styleExt.value;
+  const rulesText = (highlighter.module?.rules || []).join('\n');
+
+  assert.equal(highlighter.style([cm.tags.list]), null, 'List container text must not be styled as faint syntax');
+  const markerClass = highlighter.style([cm.tags.processingInstruction]);
+  const taskBracketClass = highlighter.style([cm.tags.atom]);
+  const linkClass = highlighter.style([cm.tags.link]);
+  const urlClass = highlighter.style([cm.tags.url]);
+
+  assert.ok(markerClass, 'Expected style class for processingInstruction markers');
+  assert.ok(taskBracketClass, 'Expected style class for TaskMarker atom brackets');
+  assert.ok(linkClass && urlClass, 'Expected style classes for links and URLs');
+  assert.notEqual(markerClass, linkClass);
+  assert.match(rulesText, new RegExp(`\\.${markerClass}[^}]*--ui-fg-faint`));
+  assert.match(rulesText, new RegExp(`\\.${linkClass}[^}]*--ui-primary`));
+});

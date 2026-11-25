@@ -1446,7 +1446,7 @@ button {
 .notes-editor .cm-md-indent-guide {
   position: relative;
   display: inline-block;
-  width: 0;
+  width: 10px;
   height: 1em;
   vertical-align: baseline;
   pointer-events: none;
@@ -1455,7 +1455,7 @@ button {
 .notes-editor .cm-md-indent-guide::before {
   content: "";
   position: absolute;
-  left: 3px;
+  left: 4.5px;
   top: -0.35em;
   bottom: -0.35em;
   border-left: 1px solid var(--ui-line);

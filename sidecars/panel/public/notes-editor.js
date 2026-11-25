@@ -1697,7 +1697,9 @@
       { tag: [t.link, t.url], color: 'var(--ui-primary)' },
       { tag: t.quote, color: 'var(--ui-fg-muted)' },
       {
-        tag: [t.meta, t.processingInstruction, t.punctuation, t.contentSeparator, t.list],
+        // Lezer tags entire BulletList/OrderedList/Task blocks with t.list; keep list content
+        // readable and dim only markers (processingInstruction) and task brackets [ ]/[x] (atom).
+        tag: [t.meta, t.processingInstruction, t.punctuation, t.contentSeparator, t.atom],
         color: 'var(--ui-fg-faint)',
       },
     ]);
