@@ -7,14 +7,14 @@ A lightweight, project-scoped personal scratchpad plugin for Antigravity. It run
 - **Links strip:** Save quick project URLs (`http`/`https`) with inline capture and one-click removal.
 - **Todos checklist:** Quick-add tasks, toggle completion, inline edit, and clear completed items.
 - **Files shelf:** Project and Global tabs above Notes; upload via picker or drag-and-drop, create inline with `+ New .md`, or import by local path (10 MB limit, duplicate auto-renaming); copy `@<path>` mentions to attach, copy raw paths, open in external editors (`subl`, `code`, `cursor`, `agy`, system default, or custom), rename, and delete.
-- **Auto-saving notes:** Freeform notes pad that persists across workspace switches.
+- **Hybrid Markdown notes:** Obsidian-style Live Preview Markdown editor (headings, bold/italic/strikethrough/inline code, clickable `- [ ]`/`- [x]` task checkboxes, nested bullets with indent guides, links, blockquotes, horizontal rules, smart list continuation/indentation, and formatting hotkeys) with a **Source** toggle button and debounced auto-save across workspace switches.
 - **Export `.md`:** Copy or download the active project's scratchpad as Markdown.
 - **Agent MCP & `/todo` skill:** Exposes an `agy-todo` stdio MCP server (`save_file`, `edit_file`, `list_files`, `read_file`, `get_scratchpad`, `add_todo`, `toggle_todo`, `append_notes`, `add_link`) and a `/todo` skill so agents can save docs, todos, links, and notes directly into AGY Todo without touching target repositories, with live panel refresh.
-- **Zero dependencies & zero build step:** Uses only Node.js built-in modules, Antigravity `sidecar_sdk`, and vanilla HTML/CSS/JS.
+- **Zero dependencies & zero build step:** Uses only Node.js built-in modules, Antigravity `sidecar_sdk`, vanilla HTML/CSS/JS, and a pre-built checked-in CodeMirror 6 bundle (`sidecars/panel/public/vendor/cm6-bundle.js`).
 
 ## Installation
 
-Only Node.js is required; there is no `npm install` or build step. Both the Antigravity app and the `agy` CLI share plugins installed under `~/.gemini/config/plugins/`.
+Only Node.js is required; there is no `npm install` or build step (the CodeMirror 6 vendor bundle is pre-built and checked in). Both the Antigravity app and the `agy` CLI share plugins installed under `~/.gemini/config/plugins/`.
 
 ### Option 1: Install with the `agy` CLI (recommended)
 

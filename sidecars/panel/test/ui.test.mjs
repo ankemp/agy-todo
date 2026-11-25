@@ -150,10 +150,23 @@ test('public/index.html loads preload, styles, classic helpers/app scripts, and 
   const html = readFileSync(join(publicDir, 'index.html'), 'utf8');
 
   assert.match(html, /<script\s+src="\/preload\.js"><\/script>/);
+  assert.match(html, /<head>[\s\S]*?<script\s+src="\/preload\.js"><\/script>/);
+  const headHtml = html.slice(html.indexOf('<head>'), html.indexOf('</head>'));
+  assert.equal(headHtml.indexOf('<script '), headHtml.indexOf('<script src="/preload.js"></script>'));
+
   assert.match(html, /<link\s+rel="stylesheet"\s+href="\/styles\.css"\s*\/?>/);
+  assert.match(html, /<script\s+src="\/vendor\/cm6-bundle\.js"><\/script>/);
   assert.match(html, /<script\s+src="\/helpers\.js"><\/script>/);
+  assert.match(html, /<script\s+src="\/notes-editor\.js"><\/script>/);
   assert.match(html, /<script\s+src="\/app\.js"><\/script>/);
   assert.doesNotMatch(html, /type="module"/);
+
+  const cmIdx = html.indexOf('<script src="/vendor/cm6-bundle.js"></script>');
+  const helpersIdx = html.indexOf('<script src="/helpers.js"></script>');
+  const notesEdIdx = html.indexOf('<script src="/notes-editor.js"></script>');
+  const appIdx = html.indexOf('<script src="/app.js"></script>');
+  assert.ok(cmIdx !== -1 && helpersIdx !== -1 && notesEdIdx !== -1 && appIdx !== -1);
+  assert.ok(cmIdx < helpersIdx && helpersIdx < notesEdIdx && notesEdIdx < appIdx, 'Classic scripts must load in dependency order before app.js');
 
   // Required landmarks and controls
   assert.match(html, /id="empty-state"/);
@@ -163,7 +176,16 @@ test('public/index.html loads preload, styles, classic helpers/app scripts, and 
   assert.match(html, /id="links-section"/);
   assert.match(html, /id="todos-section"/);
   assert.match(html, /id="notes-section"/);
+  assert.match(html, /id="notes-mode-btn"[^>]*aria-pressed="false"/);
+  assert.match(html, /<div\b[^>]*id="notes-editor"[^>]*\bhidden\b/);
   assert.match(html, /<textarea\b[^>]*id="notes-input"/);
+
+  const notesSectionStart = html.indexOf('id="notes-section"');
+  const notesSectionEnd = html.indexOf('</section>', notesSectionStart);
+  const notesSectionHtml = html.slice(notesSectionStart, notesSectionEnd);
+  assert.ok(notesSectionHtml.includes('id="notes-mode-btn"'));
+  assert.ok(notesSectionHtml.includes('id="notes-editor"'));
+  assert.ok(notesSectionHtml.includes('id="notes-input"'));
 });
 
 test('extractWorkspaceUrisFromMetadata extracts and deduplicates workspace URIs', () => {
@@ -275,14 +297,28 @@ test('public/index.html includes #files-section above #notes-section with Projec
   assert.match(html, /id="files-list"/);
 });
 
-test('public/app.js is valid classic JS, avoids raw HTML sinks, and wires all file API routes', () => {
+test('public/notes-editor.js and public/app.js are valid classic JS, avoid raw HTML sinks, and wire hybrid notes + file routes', () => {
+  const notesEditorJs = readFileSync(join(publicDir, 'notes-editor.js'), 'utf8');
   const appJs = readFileSync(join(publicDir, 'app.js'), 'utf8');
 
   // Must parse cleanly as classic script without ESM syntax
+  assert.doesNotThrow(() => new vm.Script(notesEditorJs, { filename: 'public/notes-editor.js' }));
   assert.doesNotThrow(() => new vm.Script(appJs, { filename: 'public/app.js' }));
 
   // Must avoid unsafe HTML injection sinks
-  assert.doesNotMatch(appJs, /\binnerHTML\b|\bouterHTML\b|\binsertAdjacentHTML\b|document\.write\b/);
+  const sinkRe = /\binnerHTML\b|\bouterHTML\b|\binsertAdjacentHTML\b|document\.write\b/;
+  assert.doesNotMatch(notesEditorJs, sinkRe);
+  assert.doesNotMatch(appJs, sinkRe);
+
+  // Must wire AGYNotesEditor + history reset / focus / export contracts
+  assert.ok(appJs.includes('AGYNotesEditor'), 'Expected app.js to wire AGYNotesEditor');
+  assert.ok(appJs.includes('createFallbackNotesAdapter'), 'Expected app.js to define createFallbackNotesAdapter');
+  assert.ok(appJs.includes('notes-mode-btn'), 'Expected app.js to wire #notes-mode-btn');
+  assert.ok(appJs.includes('notes-editor'), 'Expected app.js to wire #notes-editor');
+  assert.match(appJs, /resetHistory:\s*true/, 'Expected switchWorkspace to reset notes history');
+  assert.match(appJs, /resetHistory:\s*false/, 'Expected background refresh to preserve notes history');
+  assert.match(appJs, /isFocused:\s*notesEditor\.isFocused\(\)/, 'Expected refresh check to use notesEditor.isFocused()');
+  assert.ok(appJs.includes('notesEditor.getValue()'), 'Expected app.js to read notes via notesEditor.getValue()');
 
   // Must integrate all files and settings routes
   for (const route of [
@@ -511,10 +547,24 @@ function createMockDomSandbox({
   initialColor = 'rgb(247, 247, 248)',
   prefersDark = false,
   sidecar = {},
+  withNotesEditor = true,
+  wrapNotesEditor = null,
+  clipboard = null,
 } = {}) {
   const timers = new Set();
   const intervals = new Set();
   const observers = [];
+  const openCalls = [];
+  const storageMap = new Map();
+  const localStorageMock = {
+    getItem: (key) => (storageMap.has(key) ? storageMap.get(key) : null),
+    setItem: (key, value) => {
+      storageMap.set(key, String(value));
+    },
+    removeItem: (key) => {
+      storageMap.delete(key);
+    },
+  };
 
   class MockClassList {
     constructor(el) {
@@ -552,6 +602,14 @@ function createMockDomSandbox({
       if (!this._listeners.has(type)) this._listeners.set(type, []);
       this._listeners.get(type).push(fn);
     }
+    removeEventListener(type, fn) {
+      const list = this._listeners.get(type);
+      if (!list) return;
+      this._listeners.set(
+        type,
+        list.filter((entry) => entry !== fn),
+      );
+    }
     dispatchEvent(event) {
       if (!event.target) event.target = this;
       event.currentTarget = this;
@@ -575,6 +633,7 @@ function createMockDomSandbox({
     constructor(tagName, ownerDocument) {
       super();
       this.tagName = String(tagName || 'div').toUpperCase();
+      this.nodeType = 1;
       this.ownerDocument = ownerDocument;
       this.children = [];
       this.parentNode = null;
@@ -592,7 +651,9 @@ function createMockDomSandbox({
       this.hidden = false;
       this.disabled = false;
       this.value = '';
+      this.placeholder = '';
       this.textContent = '';
+      this.title = '';
       this.checked = false;
       this.selected = false;
       this.offsetHeight = 140;
@@ -629,14 +690,25 @@ function createMockDomSandbox({
     remove() {
       if (this.parentNode) this.parentNode.removeChild(this);
     }
+    contains(target) {
+      let cur = target;
+      while (cur) {
+        if (cur === this) return true;
+        cur = cur.parentNode;
+      }
+      return false;
+    }
     setAttribute(name, value) {
       const str = String(value);
       this._attrs.set(name, str);
       if (name === 'id') this.id = str;
       if (name === 'role') this.role = str;
+      if (name === 'placeholder') this.placeholder = str;
+      if (name === 'title') this.title = str;
     }
     getAttribute(name) {
       if (name === 'id') return this.id ?? null;
+      if (name === 'title' && this.title) return this.title;
       return this._attrs.has(name) ? this._attrs.get(name) : null;
     }
     focus() {
@@ -763,7 +835,10 @@ function createMockDomSandbox({
   register('files-drop-hint', 'div', { hidden: true }, filesSection);
   register('files-list', 'ul', {}, filesSection);
 
-  register('notes-input', 'textarea', {}, appShell);
+  const notesSection = register('notes-section', 'section', { class: 'notes-section' }, appShell);
+  register('notes-mode-btn', 'button', { class: 'btn btn-ghost btn-xs notes-mode-btn', 'aria-pressed': 'false', title: 'Toggle raw Markdown source' }, notesSection);
+  register('notes-editor', 'div', { class: 'notes-editor', hidden: true }, notesSection);
+  register('notes-input', 'textarea', { class: 'notes-input', placeholder: 'Jot down project notes…' }, notesSection);
   register('toast', 'div', { class: 'toast', role: 'status', hidden: true });
 
   let currentBgColor = initialColor;
@@ -774,6 +849,10 @@ function createMockDomSandbox({
   win.location = { search };
   win.sidecar = sidecar;
   win.matchMedia = () => ({ matches: prefersDark });
+  win.localStorage = localStorageMock;
+  win.open = (...args) => {
+    openCalls.push(args);
+  };
 
   class MockMutationObserver {
     constructor(cb) {
@@ -796,7 +875,8 @@ function createMockDomSandbox({
     MutationObserver: MockMutationObserver,
     getComputedStyle: () => ({ color: currentBgColor }),
     queueMicrotask,
-    navigator: {},
+    navigator: clipboard ? { clipboard } : {},
+    localStorage: localStorageMock,
     Blob,
     console,
     setTimeout: (fn, ms) => {
@@ -826,12 +906,21 @@ function createMockDomSandbox({
   win.AGYTodoHelpers = loadHelpers(win, win);
 
   const context = vm.createContext(sandbox);
+  if (withNotesEditor) {
+    const notesEditorJs = readFileSync(join(publicDir, 'notes-editor.js'), 'utf8');
+    vm.runInContext(notesEditorJs, context, { filename: 'public/notes-editor.js' });
+    if (typeof wrapNotesEditor === 'function') {
+      wrapNotesEditor(win.AGYNotesEditor, { doc, win, context });
+    }
+  }
   const appJs = readFileSync(join(publicDir, 'app.js'), 'utf8');
   vm.runInContext(appJs, context, { filename: 'public/app.js' });
 
   return {
     window: win,
     document: doc,
+    storage: localStorageMock,
+    openCalls,
     setBgColor(color) {
       currentBgColor = color;
       for (const obs of observers) obs.trigger();
@@ -1014,4 +1103,187 @@ test('app.js runtime handles theme sync, loading->empty/app transitions, diffed 
     const restoredToggleBtn = dom.document.getElementById('files-list').querySelector('.open-split-toggle');
     assert.equal(dom.document.activeElement, restoredToggleBtn);
   }
+});
+
+test('app.js wires AGYNotesEditor for workspace switching, polling refresh guard, Source mode toggle, autosave, openUrl, and export', async (t) => {
+  const flushMicrotasks = (ms = 20) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const workspaces = {
+    'file:///ws-a': {
+      displayName: 'ws-a',
+      canonicalPath: '/ws-a',
+      links: [],
+      todos: [],
+      notes: '# Workspace A',
+    },
+    'file:///ws-b': {
+      displayName: 'ws-b',
+      canonicalPath: '/ws-b',
+      links: [],
+      todos: [],
+      notes: '## Workspace B',
+    },
+  };
+
+  const savedNotesPosts = [];
+  const copiedMarkdown = [];
+  const createCalls = [];
+  const setValueCalls = [];
+  const setDisabledCalls = [];
+  let forceFocused = false;
+
+  const dom = createMockDomSandbox({
+    clipboard: {
+      writeText: async (text) => {
+        copiedMarkdown.push(text);
+      },
+    },
+    wrapNotesEditor: (api) => {
+      const origCreate = api.createNotesEditor;
+      api.createNotesEditor = (opts) => {
+        createCalls.push(opts);
+        const ctrl = origCreate(opts);
+        const origSetValue = ctrl.setValue;
+        const origSetDisabled = ctrl.setDisabled;
+        const origIsFocused = ctrl.isFocused;
+        return {
+          ...ctrl,
+          setValue(nextText, setOpts) {
+            setValueCalls.push({ nextText, resetHistory: Boolean(setOpts && setOpts.resetHistory) });
+            return origSetValue(nextText, setOpts);
+          },
+          setDisabled(disabled) {
+            setDisabledCalls.push(Boolean(disabled));
+            return origSetDisabled(disabled);
+          },
+          isFocused() {
+            return forceFocused || origIsFocused();
+          },
+        };
+      };
+    },
+    sidecar: {
+      getWorkspaceUris: async () => ['file:///ws-a', 'file:///ws-b'],
+      fetch: async (url, options = {}) => {
+        if (url.startsWith('/api/scratchpad?')) {
+          const uri = decodeURIComponent(url.split('workspaceUri=')[1] || '');
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify(workspaces[uri]),
+          };
+        }
+        if (url === '/api/notes') {
+          const body = JSON.parse(options.body || '{}');
+          savedNotesPosts.push(body);
+          workspaces[body.workspaceUri].notes = body.notes;
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify(workspaces[body.workspaceUri]),
+          };
+        }
+        if (url.startsWith('/api/files?')) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({ files: [], settings: { defaultEditor: 'system', customEditorCommand: '' } }),
+          };
+        }
+        return { ok: true, status: 200, text: async () => '{}' };
+      },
+    },
+  });
+  t.after(() => dom.cleanup());
+
+  await flushMicrotasks();
+
+  // Verify createNotesEditor wiring and initial workspace load
+  assert.equal(createCalls.length, 1);
+  assert.equal(createCalls[0].mountEl, dom.document.getElementById('notes-editor'));
+  assert.equal(createCalls[0].fallbackEl, dom.document.getElementById('notes-input'));
+  assert.equal(createCalls[0].modeToggleEl, dom.document.getElementById('notes-mode-btn'));
+  assert.equal(typeof createCalls[0].openUrl, 'function');
+
+  // openUrl forwards to window.open(..., '_blank', 'noopener,noreferrer')
+  createCalls[0].openUrl('https://example.com/docs');
+  assert.deepEqual(dom.openCalls, [['https://example.com/docs', '_blank', 'noopener,noreferrer']]);
+
+  // Initial switchWorkspace called setValue('', { resetHistory: true }) then setValue('# Workspace A', { resetHistory: true })
+  assert.deepEqual(setValueCalls.slice(0, 2), [
+    { nextText: '', resetHistory: true },
+    { nextText: '# Workspace A', resetHistory: true },
+  ]);
+  assert.deepEqual(setDisabledCalls.slice(0, 2), [true, false]);
+  assert.equal(dom.document.getElementById('notes-input').value, '# Workspace A');
+
+  // Source mode button toggles aria-pressed, .is-source, and localStorage
+  const modeBtn = dom.document.getElementById('notes-mode-btn');
+  const editorMount = dom.document.getElementById('notes-editor');
+  assert.equal(modeBtn.getAttribute('aria-pressed'), 'false');
+  modeBtn.click();
+  assert.equal(modeBtn.getAttribute('aria-pressed'), 'true');
+  assert.equal(editorMount.classList.contains('is-source'), true);
+  assert.equal(dom.storage.getItem('agy-todo.notes-mode'), 'source');
+
+  // Polling refresh skips update when notesEditor.isFocused() is true
+  workspaces['file:///ws-a'].notes = '# Workspace A remote';
+  forceFocused = true;
+  dom.window.dispatchEvent({ type: 'focus' });
+  await flushMicrotasks();
+  assert.equal(dom.document.getElementById('notes-input').value, '# Workspace A');
+
+  // Polling refresh applies update with { resetHistory: false } when blurred
+  forceFocused = false;
+  dom.window.dispatchEvent({ type: 'focus' });
+  await flushMicrotasks();
+  assert.equal(dom.document.getElementById('notes-input').value, '# Workspace A remote');
+  assert.deepEqual(setValueCalls[setValueCalls.length - 1], {
+    nextText: '# Workspace A remote',
+    resetHistory: false,
+  });
+
+  // Switching workspace via #workspace-select flushes and resets history for workspace B
+  const wsSelect = dom.document.getElementById('workspace-select');
+  wsSelect.value = 'file:///ws-b';
+  wsSelect.dispatchEvent({ type: 'change' });
+  await flushMicrotasks();
+  assert.deepEqual(setValueCalls.slice(-2), [
+    { nextText: '', resetHistory: true },
+    { nextText: '## Workspace B', resetHistory: true },
+  ]);
+
+  // Typing triggers debounced autosave and Export .md reads notesEditor.getValue()
+  const notesInput = dom.document.getElementById('notes-input');
+  notesInput.value = '## Workspace B\n- [x] Shipped';
+  notesInput.dispatchEvent({ type: 'input' });
+  assert.equal(dom.document.getElementById('save-status').textContent, 'Saving…');
+  await flushMicrotasks(450);
+  assert.deepEqual(savedNotesPosts, [
+    { workspaceUri: 'file:///ws-b', notes: '## Workspace B\n- [x] Shipped' },
+  ]);
+  assert.equal(dom.document.getElementById('save-status').textContent, 'Saved');
+
+  dom.document.getElementById('export-btn').click();
+  await flushMicrotasks();
+  assert.equal(copiedMarkdown.length, 1);
+  assert.match(copiedMarkdown[0], /## Notes\n## Workspace B\n- \[x\] Shipped\n$/);
+
+  // Fallback adapter works when AGYNotesEditor is unavailable
+  const fallbackDom = createMockDomSandbox({
+    withNotesEditor: false,
+    sidecar: {
+      getWorkspaceUris: async () => ['file:///ws-a'],
+      fetch: async (url) => {
+        if (url.startsWith('/api/scratchpad?')) {
+          return { ok: true, status: 200, text: async () => JSON.stringify(workspaces['file:///ws-a']) };
+        }
+        return { ok: true, status: 200, text: async () => JSON.stringify({ files: [], settings: {} }) };
+      },
+    },
+  });
+  t.after(() => fallbackDom.cleanup());
+  await flushMicrotasks();
+  assert.equal(fallbackDom.document.getElementById('notes-input').value, '# Workspace A remote');
+  assert.equal(fallbackDom.document.getElementById('notes-mode-btn').hidden, true);
 });

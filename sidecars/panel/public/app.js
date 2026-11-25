@@ -79,6 +79,8 @@ const filesStatusEl = document.getElementById('files-status');
 const filesDropHintEl = document.getElementById('files-drop-hint');
 const filesListEl = document.getElementById('files-list');
 
+const notesModeBtnEl = document.getElementById('notes-mode-btn');
+const notesEditorEl = document.getElementById('notes-editor');
 const notesInputEl = document.getElementById('notes-input');
 
 let workspaceUris = [];
@@ -245,6 +247,65 @@ async function postJson(path, payload) {
   });
 }
 
+function createFallbackNotesAdapter({
+  mountEl,
+  fallbackEl,
+  modeToggleEl,
+  placeholderText,
+  onChange,
+  onBlur,
+} = {}) {
+  let currentMode = 'live';
+  if (mountEl) {
+    mountEl.hidden = true;
+  }
+  if (fallbackEl) {
+    fallbackEl.hidden = false;
+    if (typeof placeholderText === 'string' && placeholderText && !fallbackEl.placeholder) {
+      fallbackEl.placeholder = placeholderText;
+    }
+    fallbackEl.addEventListener('input', () => {
+      if (typeof onChange === 'function') {
+        onChange(String(fallbackEl.value || ''));
+      }
+    });
+    fallbackEl.addEventListener('blur', () => {
+      if (typeof onBlur === 'function') {
+        onBlur();
+      }
+    });
+  }
+  if (modeToggleEl) {
+    modeToggleEl.hidden = true;
+  }
+  return {
+    getValue: () => (fallbackEl ? String(fallbackEl.value || '') : ''),
+    setValue: (nextText) => {
+      const value = typeof nextText === 'string' ? nextText : '';
+      if (fallbackEl && fallbackEl.value !== value) {
+        fallbackEl.value = value;
+      }
+    },
+    setDisabled: (disabled) => {
+      if (fallbackEl) {
+        fallbackEl.disabled = Boolean(disabled);
+      }
+    },
+    isFocused: () => Boolean(fallbackEl && document.activeElement === fallbackEl),
+    getMode: () => currentMode,
+    setMode: (mode) => {
+      currentMode = mode === 'source' ? 'source' : 'live';
+    },
+    focus: () => {
+      if (fallbackEl && typeof fallbackEl.focus === 'function') {
+        fallbackEl.focus();
+      }
+    },
+    destroy: () => {},
+    isRichMode: () => false,
+  };
+}
+
 const autosaver = createNotesAutosaver({
   delayMs: 400,
   saveFn: async (workspaceUri, notes) => {
@@ -257,7 +318,7 @@ const autosaver = createNotesAutosaver({
         scratchpad = {
           ...scratchpad,
           ...updated,
-          notes: notesInputEl.value,
+          notes: notesEditor.getValue(),
         };
         setStatus('saved', 'Saved');
       }
@@ -266,6 +327,28 @@ const autosaver = createNotesAutosaver({
         setStatus('error', 'Save failed');
       }
       throw err;
+    }
+  },
+});
+
+const notesEditor = (window.AGYNotesEditor?.createNotesEditor || createFallbackNotesAdapter)({
+  mountEl: notesEditorEl,
+  fallbackEl: notesInputEl,
+  modeToggleEl: notesModeBtnEl,
+  placeholderText: notesInputEl?.placeholder || '',
+  onChange: (value) => {
+    if (!activeWorkspaceUri) return;
+    setStatus('saving', 'Saving…');
+    autosaver.schedule(activeWorkspaceUri, value);
+  },
+  onBlur: () => {
+    void autosaver.flush().catch((err) => {
+      console.error('Failed to flush notes on blur:', err);
+    });
+  },
+  openUrl: (url) => {
+    if (typeof window.open === 'function') {
+      window.open(url, '_blank', 'noopener,noreferrer');
     }
   },
 });
@@ -451,10 +534,12 @@ function renderTodos() {
   }
 }
 
-function renderNotes() {
+function renderNotes({ resetHistory = false } = {}) {
   const nextNotes = typeof scratchpad?.notes === 'string' ? scratchpad.notes : '';
-  if (notesInputEl.value !== nextNotes) {
-    notesInputEl.value = nextNotes;
+  if (resetHistory) {
+    notesEditor.setValue(nextNotes, { resetHistory: true });
+  } else if (notesEditor.getValue() !== nextNotes) {
+    notesEditor.setValue(nextNotes, { resetHistory: false });
   }
 }
 
@@ -844,14 +929,14 @@ function renderFiles() {
   }
 }
 
-function renderAll() {
+function renderAll({ resetHistory = false } = {}) {
   renderHeader();
   renderWorkspaceSelector();
   renderLinks();
   renderTodos();
   renderFiles();
   renderEditorSettings();
-  renderNotes();
+  renderNotes({ resetHistory });
 }
 
 function closeLinkForm() {
@@ -1170,8 +1255,8 @@ async function switchWorkspace(nextUri) {
   editingFileName = null;
   openMenuForFile = null;
   filesList = [];
-  notesInputEl.value = '';
-  notesInputEl.disabled = true;
+  notesEditor.setValue('', { resetHistory: true });
+  notesEditor.setDisabled(true);
   closeLinkForm();
   closeAllFilePanels();
   showFilesStatus('');
@@ -1191,8 +1276,8 @@ async function switchWorkspace(nextUri) {
     );
     if (seq !== loadSeq || nextUri !== activeWorkspaceUri) return;
     scratchpad = data;
-    notesInputEl.disabled = false;
-    renderAll();
+    notesEditor.setDisabled(false);
+    renderAll({ resetHistory: true });
     lastRenderedScratchpadSig = scratchpadRenderSignature(scratchpad);
     setStatus('saved', 'Saved');
   } catch (err) {
@@ -1253,7 +1338,7 @@ async function refreshActiveWorkspace() {
         ) {
           const nextSig = scratchpadRenderSignature(nextScratchpad);
           scratchpad = nextScratchpad;
-          notesInputEl.disabled = false;
+          notesEditor.setDisabled(false);
           if (nextSig !== lastRenderedScratchpadSig) {
             renderHeader();
             renderLinks();
@@ -1264,7 +1349,7 @@ async function refreshActiveWorkspace() {
           }
           if (
             shouldApplyNotesRefresh({
-              isFocused: document.activeElement === notesInputEl,
+              isFocused: notesEditor.isFocused(),
               hasPending: autosaver.hasPending(),
             })
           ) {
@@ -1300,6 +1385,8 @@ function enqueueWorkspaceUris(rawUris) {
         editingFileName = null;
         openMenuForFile = null;
         filesList = [];
+        notesEditor.setValue('', { resetHistory: true });
+        notesEditor.setDisabled(true);
         closeLinkForm();
         closeAllFilePanels();
         showFilesStatus('');
@@ -1671,18 +1758,6 @@ window.addEventListener('scroll', () => {
   }
 }, { passive: true });
 
-notesInputEl.addEventListener('input', () => {
-  if (!activeWorkspaceUri) return;
-  setStatus('saving', 'Saving…');
-  autosaver.schedule(activeWorkspaceUri, notesInputEl.value);
-});
-
-notesInputEl.addEventListener('blur', () => {
-  void autosaver.flush().catch((err) => {
-    console.error('Failed to flush notes on blur:', err);
-  });
-});
-
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') {
     void autosaver.flush().catch((err) => {
@@ -1711,7 +1786,7 @@ exportBtnEl.addEventListener('click', async () => {
   if (!scratchpad) return;
   const current = {
     ...scratchpad,
-    notes: notesInputEl.value,
+    notes: notesEditor.getValue(),
   };
   const markdown = formatMarkdown(current);
   const safeBase = (current.displayName || 'scratchpad')

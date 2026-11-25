@@ -165,7 +165,9 @@
       <section id="notes-section" class="notes-section" aria-label="Notes">
         <div class="section-header">
           <h2 class="section-title">Notes</h2>
+          <button id="notes-mode-btn" class="btn btn-ghost btn-xs notes-mode-btn" type="button" aria-pressed="false" title="Toggle raw Markdown source">Source</button>
         </div>
+        <div id="notes-editor" class="notes-editor" hidden></div>
         <textarea id="notes-input" class="notes-input" placeholder="Jot down project notes, commands, or reminders…" aria-label="Project notes"></textarea>
       </section>
     </div>
@@ -173,7 +175,9 @@
     <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   </main>
 
+  <script src="/vendor/cm6-bundle.js"></script>
   <script src="/helpers.js"></script>
+  <script src="/notes-editor.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>
