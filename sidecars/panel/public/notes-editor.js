@@ -1268,7 +1268,1024 @@
     return extensions;
   }
 
+  var NOTES_MODE_STORAGE_KEY = 'agy-todo.notes-mode';
+  var EXTERNAL_SYNC_USER_EVENT = 'externalSync';
+  var widgetClassCache = typeof WeakMap === 'function' ? new WeakMap() : null;
+
+  function normalizeNotesMode(mode) {
+    return mode === 'source' ? 'source' : 'live';
+  }
+
+  function resolveStorage(storage) {
+    if (storage !== undefined) {
+      return storage;
+    }
+    try {
+      if (typeof localStorage !== 'undefined' && localStorage) {
+        return localStorage;
+      }
+    } catch (_err) {
+      return null;
+    }
+    try {
+      if (root && root.localStorage) {
+        return root.localStorage;
+      }
+    } catch (_err2) {
+      return null;
+    }
+    return null;
+  }
+
+  /**
+   * Loads the saved notes view mode ('live' or 'source') from storage,
+   * defaulting to 'live' when unset, invalid, or storage throws.
+   * @param {Storage | null} [storage]
+   * @returns {'live' | 'source'}
+   */
+  function loadSavedNotesMode(storage) {
+    try {
+      var target = resolveStorage(storage);
+      if (!target || typeof target.getItem !== 'function') {
+        return 'live';
+      }
+      var raw = target.getItem(NOTES_MODE_STORAGE_KEY);
+      return raw === 'source' ? 'source' : 'live';
+    } catch (_err) {
+      return 'live';
+    }
+  }
+
+  /**
+   * Persists the notes view mode ('live' or 'source') safely to storage.
+   * @param {'live' | 'source'} mode
+   * @param {Storage | null} [storage]
+   */
+  function saveNotesMode(mode, storage) {
+    var normalized = normalizeNotesMode(mode);
+    try {
+      var target = resolveStorage(storage);
+      if (target && typeof target.setItem === 'function') {
+        target.setItem(NOTES_MODE_STORAGE_KEY, normalized);
+      }
+    } catch (_err) {
+      // Ignore storage quota or sandbox access errors.
+    }
+  }
+
+  function getWidgetConstructors(resolvedCm) {
+    if (!resolvedCm || !resolvedCm.WidgetType) {
+      return null;
+    }
+    var BaseWidget = resolvedCm.WidgetType;
+    if (widgetClassCache && widgetClassCache.has(BaseWidget)) {
+      return widgetClassCache.get(BaseWidget);
+    }
+
+    class CheckboxWidget extends BaseWidget {
+      constructor(checked, markerFrom, markerTo, disabled) {
+        super();
+        this.checked = Boolean(checked);
+        this.markerFrom = markerFrom;
+        this.markerTo = markerTo;
+        this.disabled = Boolean(disabled);
+      }
+
+      eq(other) {
+        return Boolean(
+          other &&
+            this.checked === other.checked &&
+            this.markerFrom === other.markerFrom &&
+            this.markerTo === other.markerTo &&
+            this.disabled === other.disabled
+        );
+      }
+
+      ignoreEvent() {
+        return true;
+      }
+
+      updateDOM(dom, view) {
+        var locked = Boolean(this.disabled) || !isEditorEditable(view && view.state, resolvedCm);
+        dom.checked = Boolean(this.checked);
+        dom.disabled = locked;
+        dom._agyCheckboxState = {
+          checked: Boolean(this.checked),
+          markerFrom: this.markerFrom,
+          markerTo: this.markerTo,
+        };
+        return true;
+      }
+
+      toDOM(view) {
+        var input = document.createElement('input');
+        input.type = 'checkbox';
+        input.setAttribute('type', 'checkbox');
+        input.className = 'cm-md-checkbox';
+        input.setAttribute('aria-label', 'Toggle task');
+        this.updateDOM(input, view);
+
+        input.addEventListener('mousedown', function (event) {
+          if (event && typeof event.preventDefault === 'function') {
+            event.preventDefault();
+          }
+        });
+
+        input.addEventListener('change', function () {
+          var meta = input._agyCheckboxState;
+          if (!view || !view.state || !isEditorEditable(view.state, resolvedCm)) {
+            input.checked = Boolean(meta && meta.checked);
+            return;
+          }
+          var spec = computeToggleTask(view.state, meta.markerFrom, meta.markerTo);
+          if (!spec) {
+            input.checked = Boolean(meta && meta.checked);
+            return;
+          }
+          view.dispatch(spec);
+        });
+
+        return input;
+      }
+    }
+
+    class BulletWidget extends BaseWidget {
+      eq(other) {
+        return Boolean(other && other instanceof BulletWidget);
+      }
+
+      ignoreEvent() {
+        return true;
+      }
+
+      toDOM() {
+        var span = document.createElement('span');
+        span.className = 'cm-md-bullet';
+        span.setAttribute('aria-hidden', 'true');
+        span.textContent = '\u2022';
+        return span;
+      }
+    }
+
+    class HorizontalRuleWidget extends BaseWidget {
+      eq(other) {
+        return Boolean(other && other instanceof HorizontalRuleWidget);
+      }
+
+      ignoreEvent() {
+        return true;
+      }
+
+      toDOM() {
+        var span = document.createElement('span');
+        span.className = 'cm-md-hr';
+        span.setAttribute('role', 'separator');
+        span.setAttribute('aria-hidden', 'true');
+        return span;
+      }
+    }
+
+    class IndentGuideWidget extends BaseWidget {
+      constructor(depth) {
+        super();
+        this.depth = typeof depth === 'number' ? depth : 1;
+      }
+
+      eq(other) {
+        return Boolean(other && this.depth === other.depth);
+      }
+
+      ignoreEvent() {
+        return true;
+      }
+
+      toDOM() {
+        var span = document.createElement('span');
+        span.className = 'cm-md-indent-guide';
+        span.setAttribute('aria-hidden', 'true');
+        return span;
+      }
+    }
+
+    var ctors = {
+      CheckboxWidget: CheckboxWidget,
+      BulletWidget: BulletWidget,
+      HorizontalRuleWidget: HorizontalRuleWidget,
+      IndentGuideWidget: IndentGuideWidget,
+    };
+    if (widgetClassCache) {
+      widgetClassCache.set(BaseWidget, ctors);
+    }
+    return ctors;
+  }
+
+  function splitCrossLineHideSpecs(spec, doc, out) {
+    var from = Math.max(0, Math.min(spec.from, doc.length));
+    var to = Math.max(0, Math.min(spec.to, doc.length));
+    if (from >= to) {
+      return;
+    }
+    var startLine = doc.lineAt(from);
+    var endLine = doc.lineAt(to);
+    if (startLine.number === endLine.number) {
+      out.push({ kind: 'hide', from: from, to: to });
+      return;
+    }
+    for (var ln = startLine.number; ln <= endLine.number; ln += 1) {
+      var line = doc.line(ln);
+      var segFrom = Math.max(from, line.from);
+      var segTo = Math.min(to, line.to);
+      if (segFrom < segTo) {
+        out.push({ kind: 'hide', from: segFrom, to: segTo });
+      }
+    }
+  }
+
+  function normalizeSpecsForDecorationSet(specs, doc) {
+    if (!Array.isArray(specs) || specs.length === 0) {
+      return [];
+    }
+    var out = [];
+    for (var i = 0; i < specs.length; i += 1) {
+      var spec = specs[i];
+      if (!spec || typeof spec !== 'object') {
+        continue;
+      }
+      if (spec.kind === 'line') {
+        if (typeof spec.pos === 'number' && spec.pos >= 0 && (!doc || spec.pos <= doc.length)) {
+          out.push(spec);
+        }
+        continue;
+      }
+      if (typeof spec.from !== 'number' || typeof spec.to !== 'number') {
+        continue;
+      }
+      var from = doc ? Math.max(0, Math.min(spec.from, doc.length)) : Math.max(0, spec.from);
+      var to = doc ? Math.max(0, Math.min(spec.to, doc.length)) : Math.max(0, spec.to);
+      if (spec.kind === 'hide') {
+        if (from >= to) {
+          continue;
+        }
+        if (doc) {
+          splitCrossLineHideSpecs({ kind: 'hide', from: from, to: to }, doc, out);
+        } else {
+          out.push({ kind: 'hide', from: from, to: to });
+        }
+      } else if (spec.kind === 'mark') {
+        if (from < to) {
+          out.push(spec);
+        }
+      } else if (spec.kind === 'widget') {
+        if (from > to) {
+          continue;
+        }
+        if (doc && from < to && doc.lineAt(from).number !== doc.lineAt(to).number) {
+          continue;
+        }
+        out.push(spec);
+      }
+    }
+    out.sort(compareSpecs);
+
+    var resolved = [];
+    var lastReplaceEnd = -1;
+    var needsResort = false;
+    for (var j = 0; j < out.length; j += 1) {
+      var item = out[j];
+      if (item.kind === 'hide') {
+        if (item.from < lastReplaceEnd) {
+          if (lastReplaceEnd >= item.to) {
+            continue;
+          }
+          item = { kind: 'hide', from: lastReplaceEnd, to: item.to };
+          needsResort = true;
+        }
+        lastReplaceEnd = item.to;
+      } else if (item.kind === 'widget') {
+        if (item.from < lastReplaceEnd) {
+          continue;
+        }
+        if (item.from < item.to) {
+          lastReplaceEnd = item.to;
+        }
+      }
+      resolved.push(item);
+    }
+
+    if (needsResort) {
+      resolved.sort(compareSpecs);
+    }
+    return resolved;
+  }
+
+  function createWidgetForSpec(widgets, spec, disabled) {
+    if (spec.widget === 'checkbox') {
+      return new widgets.CheckboxWidget(spec.checked, spec.markerFrom, spec.markerTo, disabled);
+    }
+    if (spec.widget === 'bullet') {
+      return new widgets.BulletWidget();
+    }
+    if (spec.widget === 'hr') {
+      return new widgets.HorizontalRuleWidget();
+    }
+    return new widgets.IndentGuideWidget(spec.depth);
+  }
+
+  /**
+   * Builds a CodeMirror 6 DecorationSet from Live Preview specs using RangeSetBuilder,
+   * enforcing sort order, cross-line ViewPlugin safety, and non-overlapping replace bounds.
+   * @param {Array<object>} specs
+   * @param {object} [cm]
+   * @param {{ doc?: object, disabled?: boolean }} [options]
+   * @returns {object | null}
+   */
+  function buildDecorationsFromSpecs(specs, cm, options) {
+    var resolvedCm = resolveCodeMirror(cm);
+    if (!resolvedCm || !resolvedCm.RangeSetBuilder || !resolvedCm.Decoration || !resolvedCm.WidgetType) {
+      return null;
+    }
+    var opts = options || {};
+    var widgets = getWidgetConstructors(resolvedCm);
+    var normalized = normalizeSpecsForDecorationSet(specs, opts.doc || null);
+    var builder = new resolvedCm.RangeSetBuilder();
+
+    for (var i = 0; i < normalized.length; i += 1) {
+      var spec = normalized[i];
+      if (spec.kind === 'line') {
+        builder.add(spec.pos, spec.pos, resolvedCm.Decoration.line({ class: spec.className }));
+      } else if (spec.kind === 'hide') {
+        builder.add(spec.from, spec.to, resolvedCm.Decoration.replace({}));
+      } else if (spec.kind === 'mark') {
+        var markConfig = { class: spec.className };
+        if (spec.attrs) {
+          markConfig.attributes = spec.attrs;
+        }
+        builder.add(spec.from, spec.to, resolvedCm.Decoration.mark(markConfig));
+      } else if (spec.kind === 'widget') {
+        var widgetInstance = createWidgetForSpec(widgets, spec, Boolean(opts.disabled));
+        if (spec.from === spec.to) {
+          builder.add(spec.from, spec.to, resolvedCm.Decoration.widget({ widget: widgetInstance, side: -1 }));
+        } else {
+          builder.add(spec.from, spec.to, resolvedCm.Decoration.replace({ widget: widgetInstance }));
+        }
+      }
+    }
+
+    return builder.finish();
+  }
+
+  /**
+   * Computes Live Preview specs for a CodeMirror state and builds a DecorationSet.
+   * @param {object} state
+   * @param {object} [cm]
+   * @returns {object | null}
+   */
+  function buildDecorationSet(state, cm) {
+    var resolvedCm = resolveCodeMirror(cm);
+    if (!state || !resolvedCm) {
+      return null;
+    }
+    var specs = computeLivePreviewSpecs(state, resolvedCm);
+    return buildDecorationsFromSpecs(specs, resolvedCm, {
+      doc: state.doc,
+      disabled: !isEditorEditable(state, resolvedCm),
+    });
+  }
+
+  function createLivePreviewPlugin(resolvedCm) {
+    if (!resolvedCm || !resolvedCm.ViewPlugin) {
+      return [];
+    }
+    return resolvedCm.ViewPlugin.fromClass(
+      class {
+        constructor(view) {
+          this.decorations = buildDecorationSet(view.state, resolvedCm) || resolvedCm.Decoration.none;
+        }
+
+        update(update) {
+          var editableChanged =
+            Boolean(update.startState) &&
+            isEditorEditable(update.startState, resolvedCm) !== isEditorEditable(update.state, resolvedCm);
+          if (update.docChanged || update.selectionSet || update.viewportChanged || editableChanged) {
+            this.decorations = buildDecorationSet(update.state, resolvedCm) || resolvedCm.Decoration.none;
+          }
+        }
+      },
+      {
+        decorations: function (value) {
+          return value.decorations;
+        },
+      }
+    );
+  }
+
+  function createSourceHighlightExtension(resolvedCm) {
+    if (!resolvedCm || !resolvedCm.HighlightStyle || !resolvedCm.syntaxHighlighting || !resolvedCm.tags) {
+      return [];
+    }
+    var t = resolvedCm.tags;
+    var style = resolvedCm.HighlightStyle.define([
+      {
+        tag: [t.heading, t.heading1, t.heading2, t.heading3, t.heading4, t.heading5, t.heading6],
+        color: 'var(--ui-fg)',
+        fontWeight: '700',
+      },
+      { tag: t.strong, color: 'var(--ui-fg)', fontWeight: '700' },
+      { tag: t.emphasis, color: 'var(--ui-fg)', fontStyle: 'italic' },
+      { tag: t.strikethrough, color: 'var(--ui-fg-muted)', textDecoration: 'line-through' },
+      { tag: t.monospace, color: 'var(--ui-code-fg)' },
+      { tag: [t.link, t.url], color: 'var(--ui-primary)' },
+      { tag: t.quote, color: 'var(--ui-fg-muted)' },
+      {
+        tag: [t.meta, t.processingInstruction, t.punctuation, t.contentSeparator, t.list],
+        color: 'var(--ui-fg-faint)',
+      },
+    ]);
+    return resolvedCm.syntaxHighlighting(style);
+  }
+
+  /**
+   * Returns the CodeMirror mode extension for either 'live' (Live Preview plugin)
+   * or 'source' (subtle syntax-highlighted raw Markdown).
+   * @param {'live' | 'source'} mode
+   * @param {object} [cm]
+   * @returns {object | Array<object>}
+   */
+  function buildModeExtension(mode, cm) {
+    var resolvedCm = resolveCodeMirror(cm);
+    if (!resolvedCm) {
+      return [];
+    }
+    return normalizeNotesMode(mode) === 'source'
+      ? createSourceHighlightExtension(resolvedCm)
+      : createLivePreviewPlugin(resolvedCm);
+  }
+
+  function buildEditableExtension(disabled, resolvedCm) {
+    var exts = [];
+    if (resolvedCm.EditorState && resolvedCm.EditorState.readOnly) {
+      exts.push(resolvedCm.EditorState.readOnly.of(Boolean(disabled)));
+    }
+    if (resolvedCm.EditorView && resolvedCm.EditorView.editable) {
+      exts.push(resolvedCm.EditorView.editable.of(!disabled));
+    }
+    return exts;
+  }
+
+  function findLinkHrefElement(target) {
+    var cur = target;
+    if (cur && cur.nodeType === 3) {
+      cur = cur.parentElement || cur.parentNode;
+    }
+    if (!cur) {
+      return null;
+    }
+    if (typeof cur.closest === 'function') {
+      return cur.closest('[data-md-href]');
+    }
+    while (cur) {
+      if (typeof cur.getAttribute === 'function' && cur.getAttribute('data-md-href') !== null) {
+        return cur;
+      }
+      cur = cur.parentElement || cur.parentNode;
+    }
+    return null;
+  }
+
+  function openExternalUrlFallback(url) {
+    if (typeof window !== 'undefined' && typeof window.open === 'function') {
+      window.open(url, '_blank', 'noopener,noreferrer');
+      return;
+    }
+    if (root && typeof root.open === 'function') {
+      root.open(url, '_blank', 'noopener,noreferrer');
+    }
+  }
+
+  /**
+   * Handles clicks on `.cm-md-link` spans: plain clicks pass through for cursor
+   * editing, while Mod+Click (Cmd/Ctrl) opens validated http(s) URLs externally.
+   * @param {MouseEvent | object} event
+   * @param {{ openUrl?: (url: string) => void }} [options]
+   * @returns {boolean}
+   */
+  function handleLinkClick(event, options) {
+    if (!event || !(event.metaKey || event.ctrlKey)) {
+      return false;
+    }
+    if (event.button !== undefined && event.button !== 0) {
+      return false;
+    }
+    var linkEl = findLinkHrefElement(event.target);
+    if (!linkEl || typeof linkEl.getAttribute !== 'function') {
+      return false;
+    }
+    var rawHref = linkEl.getAttribute('data-md-href');
+    if (!isSafeHttpUrl(rawHref)) {
+      return false;
+    }
+    if (typeof event.preventDefault === 'function') {
+      event.preventDefault();
+    }
+    var cleanHref = rawHref.trim();
+    var openUrl = options && typeof options.openUrl === 'function' ? options.openUrl : openExternalUrlFallback;
+    openUrl(cleanHref);
+    return true;
+  }
+
+  function buildDelimiterWrapFilter(resolvedCm) {
+    if (!resolvedCm.EditorState || !resolvedCm.EditorState.transactionFilter) {
+      return [];
+    }
+    return resolvedCm.EditorState.transactionFilter.of(function (tr) {
+      if (!tr || typeof tr.isUserEvent !== 'function' || !tr.isUserEvent('input.type') || !tr.docChanged) {
+        return tr;
+      }
+      if (!tr.startState || !isEditorEditable(tr.startState, resolvedCm)) {
+        return tr;
+      }
+      var selection = tr.startState.selection;
+      if (!selection || !selection.ranges || selection.ranges.length !== 1 || selection.main.empty) {
+        return tr;
+      }
+      var sel = selection.main;
+      var changeCount = 0;
+      var changeFrom = -1;
+      var changeTo = -1;
+      var insertedText = '';
+      tr.changes.iterChanges(function (fromA, toA, _fromB, _toB, inserted) {
+        changeCount += 1;
+        changeFrom = fromA;
+        changeTo = toA;
+        insertedText = inserted.toString();
+      });
+      if (changeCount !== 1 || changeFrom !== sel.from || changeTo !== sel.to) {
+        return tr;
+      }
+      var wrapSpec = computeDelimiterWrap(tr.startState, sel.from, sel.to, insertedText);
+      return wrapSpec || tr;
+    });
+  }
+
+  function buildExternalSyncUpdateListener(resolvedCm, onChange) {
+    if (!resolvedCm.EditorView || !resolvedCm.EditorView.updateListener) {
+      return [];
+    }
+    return resolvedCm.EditorView.updateListener.of(function (viewUpdate) {
+      if (!viewUpdate || !viewUpdate.docChanged || typeof onChange !== 'function') {
+        return;
+      }
+      var txs = viewUpdate.transactions;
+      var isExternal =
+        Array.isArray(txs) &&
+        txs.length > 0 &&
+        txs.every(function (tr) {
+          return tr && typeof tr.isUserEvent === 'function' && tr.isUserEvent(EXTERNAL_SYNC_USER_EVENT);
+        });
+      if (isExternal) {
+        return;
+      }
+      onChange(viewUpdate.state.doc.toString(), viewUpdate);
+    });
+  }
+
+  /**
+   * Builds the full CodeMirror 6 extension array for the hybrid Markdown notes editor.
+   * @param {object} [options]
+   * @returns {Array<object>}
+   */
+  function buildEditorExtensions(options) {
+    var opts = options || {};
+    var resolvedCm = resolveCodeMirror(opts.cm);
+    if (!resolvedCm) {
+      return [];
+    }
+
+    var modeCompartment = opts.modeCompartment || (resolvedCm.Compartment ? new resolvedCm.Compartment() : null);
+    var editableCompartment =
+      opts.editableCompartment || (resolvedCm.Compartment ? new resolvedCm.Compartment() : null);
+    var mode = normalizeNotesMode(opts.mode);
+    var disabled = Boolean(opts.disabled);
+    var extensions = [];
+
+    if (typeof resolvedCm.markdown === 'function') {
+      var mdExts = [];
+      if (resolvedCm.Strikethrough) mdExts.push(resolvedCm.Strikethrough);
+      if (resolvedCm.TaskList) mdExts.push(resolvedCm.TaskList);
+      if (resolvedCm.Autolink) mdExts.push(resolvedCm.Autolink);
+      extensions.push(resolvedCm.markdown({ extensions: mdExts }));
+    }
+
+    extensions.push(createNotesKeymap(resolvedCm));
+
+    var baseKeymap = [];
+    if (Array.isArray(resolvedCm.defaultKeymap)) {
+      baseKeymap = baseKeymap.concat(resolvedCm.defaultKeymap);
+    }
+    if (Array.isArray(resolvedCm.historyKeymap)) {
+      baseKeymap = baseKeymap.concat(resolvedCm.historyKeymap);
+    }
+    if (resolvedCm.keymap && baseKeymap.length > 0) {
+      extensions.push(resolvedCm.keymap.of(baseKeymap));
+    }
+
+    if (typeof resolvedCm.history === 'function') {
+      extensions.push(resolvedCm.history());
+    }
+    if (typeof resolvedCm.drawSelection === 'function') {
+      extensions.push(resolvedCm.drawSelection());
+    }
+    if (resolvedCm.EditorView && resolvedCm.EditorView.lineWrapping) {
+      extensions.push(resolvedCm.EditorView.lineWrapping);
+    }
+    if (typeof opts.placeholderText === 'string' && opts.placeholderText && typeof resolvedCm.placeholder === 'function') {
+      extensions.push(resolvedCm.placeholder(opts.placeholderText));
+    }
+    if (resolvedCm.EditorView && resolvedCm.EditorView.contentAttributes) {
+      extensions.push(
+        resolvedCm.EditorView.contentAttributes.of({
+          'aria-label': opts.ariaLabel || 'Project notes',
+        })
+      );
+    }
+
+    var modeExt = buildModeExtension(mode, resolvedCm);
+    extensions.push(modeCompartment ? modeCompartment.of(modeExt) : modeExt);
+
+    var editableExt = buildEditableExtension(disabled, resolvedCm);
+    extensions.push(editableCompartment ? editableCompartment.of(editableExt) : editableExt);
+
+    extensions.push(buildDelimiterWrapFilter(resolvedCm));
+
+    if (resolvedCm.EditorView && typeof resolvedCm.EditorView.domEventHandlers === 'function') {
+      var domHandlers = {
+        mousedown: function (event) {
+          return handleLinkClick(event, { openUrl: opts.openUrl });
+        },
+      };
+      if (typeof opts.onBlur === 'function') {
+        domHandlers.blur = function (event, view) {
+          var related = event ? event.relatedTarget : null;
+          if (related && view && view.dom && typeof view.dom.contains === 'function' && view.dom.contains(related)) {
+            return false;
+          }
+          opts.onBlur();
+          return false;
+        };
+      }
+      extensions.push(resolvedCm.EditorView.domEventHandlers(domHandlers));
+    }
+
+    extensions.push(buildExternalSyncUpdateListener(resolvedCm, opts.onChange));
+    return extensions;
+  }
+
+  function toggleElementClass(el, className, force) {
+    if (!el || !el.classList || typeof el.classList.toggle !== 'function') {
+      return;
+    }
+    el.classList.toggle(className, Boolean(force));
+  }
+
+  function syncModeToggleUi(mode, mountEl, modeToggleEl) {
+    var isSource = mode === 'source';
+    toggleElementClass(mountEl, 'is-source', isSource);
+    if (modeToggleEl) {
+      if (typeof modeToggleEl.setAttribute === 'function') {
+        modeToggleEl.setAttribute('aria-pressed', isSource ? 'true' : 'false');
+      }
+      modeToggleEl.textContent = 'Source';
+      modeToggleEl.title = isSource ? 'Switch to Live Preview' : 'Toggle raw Markdown source';
+    }
+  }
+
+  function isModKeyEvent(event, isKeyUp) {
+    if (!event) {
+      return false;
+    }
+    if (isKeyUp) {
+      return Boolean((event.metaKey && event.key !== 'Meta') || (event.ctrlKey && event.key !== 'Control'));
+    }
+    return Boolean(event.metaKey || event.ctrlKey || event.key === 'Meta' || event.key === 'Control');
+  }
+
+  function resolveWindowTarget(opts) {
+    if (opts && opts.window) {
+      return opts.window;
+    }
+    if (typeof window !== 'undefined' && window) {
+      return window;
+    }
+    if (root && typeof root.addEventListener === 'function') {
+      return root;
+    }
+    return null;
+  }
+
+  function createFallbackNotesController(opts, initialMode) {
+    var mountEl = opts.mountEl || null;
+    var fallbackEl = opts.fallbackEl || null;
+    var modeToggleEl = opts.modeToggleEl || null;
+    var currentMode = initialMode;
+    var destroyed = false;
+
+    if (mountEl) {
+      mountEl.hidden = true;
+    }
+    if (fallbackEl) {
+      fallbackEl.hidden = false;
+      if (typeof opts.placeholderText === 'string' && opts.placeholderText && !fallbackEl.placeholder) {
+        fallbackEl.placeholder = opts.placeholderText;
+      }
+    }
+    syncModeToggleUi(currentMode, mountEl, modeToggleEl);
+
+    function onFallbackInput() {
+      if (typeof opts.onChange === 'function') {
+        opts.onChange(fallbackEl ? String(fallbackEl.value || '') : '');
+      }
+    }
+
+    function onFallbackBlur() {
+      if (typeof opts.onBlur === 'function') {
+        opts.onBlur();
+      }
+    }
+
+    function onToggleClick() {
+      setMode(currentMode === 'source' ? 'live' : 'source');
+    }
+
+    if (fallbackEl && typeof fallbackEl.addEventListener === 'function') {
+      fallbackEl.addEventListener('input', onFallbackInput);
+      fallbackEl.addEventListener('blur', onFallbackBlur);
+    }
+    if (modeToggleEl && typeof modeToggleEl.addEventListener === 'function') {
+      modeToggleEl.addEventListener('click', onToggleClick);
+    }
+
+    function setMode(nextMode) {
+      var normalized = normalizeNotesMode(nextMode);
+      var changed = normalized !== currentMode;
+      currentMode = normalized;
+      syncModeToggleUi(currentMode, mountEl, modeToggleEl);
+      saveNotesMode(currentMode, opts.storage);
+      if (changed && typeof opts.onModeChange === 'function') {
+        opts.onModeChange(currentMode);
+      }
+    }
+
+    return {
+      getValue: function () {
+        return fallbackEl ? String(fallbackEl.value || '') : '';
+      },
+      setValue: function (nextText) {
+        var text = typeof nextText === 'string' ? nextText : '';
+        if (fallbackEl && fallbackEl.value !== text) {
+          fallbackEl.value = text;
+        }
+      },
+      setDisabled: function (disabled) {
+        if (fallbackEl) {
+          fallbackEl.disabled = Boolean(disabled);
+        }
+      },
+      isFocused: function () {
+        return Boolean(fallbackEl && typeof document !== 'undefined' && document.activeElement === fallbackEl);
+      },
+      getMode: function () {
+        return currentMode;
+      },
+      setMode: setMode,
+      focus: function () {
+        if (fallbackEl && typeof fallbackEl.focus === 'function') {
+          fallbackEl.focus();
+        }
+      },
+      destroy: function () {
+        if (destroyed) {
+          return;
+        }
+        destroyed = true;
+        if (fallbackEl && typeof fallbackEl.removeEventListener === 'function') {
+          fallbackEl.removeEventListener('input', onFallbackInput);
+          fallbackEl.removeEventListener('blur', onFallbackBlur);
+        }
+        if (modeToggleEl && typeof modeToggleEl.removeEventListener === 'function') {
+          modeToggleEl.removeEventListener('click', onToggleClick);
+        }
+      },
+      isRichMode: function () {
+        return false;
+      },
+    };
+  }
+
+  /**
+   * Mounts a CodeMirror 6 Live Preview / Source hybrid Markdown notes editor into `mountEl`
+   * when CodeMirror 6 and browser Range APIs are available, or falls back cleanly to `fallbackEl`.
+   * @param {object} options
+   * @returns {object}
+   */
+  function createNotesEditor(options) {
+    var opts = options || {};
+    var mountEl = opts.mountEl || null;
+    var fallbackEl = opts.fallbackEl || null;
+    var modeToggleEl = opts.modeToggleEl || null;
+    var currentMode = opts.initialMode ? normalizeNotesMode(opts.initialMode) : loadSavedNotesMode(opts.storage);
+    var resolvedCm = opts.cm === null || opts.cm === false ? null : resolveCodeMirror(opts.cm);
+
+    var canMountRich =
+      Boolean(mountEl) &&
+      typeof document !== 'undefined' &&
+      typeof document.createRange === 'function' &&
+      Boolean(resolvedCm && typeof resolvedCm.EditorView === 'function' && resolvedCm.EditorState && typeof resolvedCm.EditorState.create === 'function');
+
+    if (!canMountRich) {
+      return createFallbackNotesController(opts, currentMode);
+    }
+
+    var modeCompartment = new resolvedCm.Compartment();
+    var editableCompartment = new resolvedCm.Compartment();
+    var isDisabled = Boolean(opts.disabled);
+    var destroyed = false;
+    var placeholderText =
+      typeof opts.placeholderText === 'string'
+        ? opts.placeholderText
+        : (fallbackEl && typeof fallbackEl.placeholder === 'string' ? fallbackEl.placeholder : '');
+    var ariaLabel =
+      typeof opts.ariaLabel === 'string' && opts.ariaLabel
+        ? opts.ariaLabel
+        : (fallbackEl && typeof fallbackEl.getAttribute === 'function' && fallbackEl.getAttribute('aria-label')) ||
+          'Project notes';
+    var initialDoc =
+      typeof opts.initialValue === 'string'
+        ? opts.initialValue
+        : (fallbackEl && typeof fallbackEl.value === 'string' ? fallbackEl.value : '');
+
+    function buildCurrentState(docText) {
+      var extensions = buildEditorExtensions({
+        cm: resolvedCm,
+        mode: currentMode,
+        disabled: isDisabled,
+        placeholderText: placeholderText,
+        ariaLabel: ariaLabel,
+        modeCompartment: modeCompartment,
+        editableCompartment: editableCompartment,
+        onChange: opts.onChange,
+        onBlur: opts.onBlur,
+        openUrl: opts.openUrl,
+      });
+      return resolvedCm.EditorState.create({
+        doc: docText,
+        extensions: extensions,
+      });
+    }
+
+    var view = new resolvedCm.EditorView({
+      state: buildCurrentState(initialDoc),
+      parent: mountEl,
+    });
+
+    mountEl.hidden = false;
+    if (fallbackEl) {
+      fallbackEl.hidden = true;
+    }
+    toggleElementClass(mountEl, 'is-disabled', isDisabled);
+    syncModeToggleUi(currentMode, mountEl, modeToggleEl);
+
+    var win = resolveWindowTarget(opts);
+
+    function onWindowKeyDown(event) {
+      toggleElementClass(mountEl, 'cm-mod-held', isModKeyEvent(event, false));
+    }
+
+    function onWindowKeyUp(event) {
+      toggleElementClass(mountEl, 'cm-mod-held', isModKeyEvent(event, true));
+    }
+
+    function onWindowBlur() {
+      toggleElementClass(mountEl, 'cm-mod-held', false);
+    }
+
+    function onToggleClick() {
+      setMode(currentMode === 'source' ? 'live' : 'source');
+    }
+
+    if (win && typeof win.addEventListener === 'function') {
+      win.addEventListener('keydown', onWindowKeyDown);
+      win.addEventListener('keyup', onWindowKeyUp);
+      win.addEventListener('blur', onWindowBlur);
+    }
+    if (modeToggleEl && typeof modeToggleEl.addEventListener === 'function') {
+      modeToggleEl.addEventListener('click', onToggleClick);
+    }
+
+    function setMode(nextMode) {
+      if (destroyed) {
+        return;
+      }
+      var normalized = normalizeNotesMode(nextMode);
+      var changed = normalized !== currentMode;
+      currentMode = normalized;
+      view.dispatch({
+        effects: modeCompartment.reconfigure(buildModeExtension(currentMode, resolvedCm)),
+      });
+      syncModeToggleUi(currentMode, mountEl, modeToggleEl);
+      saveNotesMode(currentMode, opts.storage);
+      if (changed && typeof opts.onModeChange === 'function') {
+        opts.onModeChange(currentMode);
+      }
+    }
+
+    return {
+      getValue: function () {
+        return view.state.doc.toString();
+      },
+      setValue: function (nextText, setOpts) {
+        if (destroyed) {
+          return;
+        }
+        var text = typeof nextText === 'string' ? nextText : '';
+        var resetHistory = Boolean(setOpts && setOpts.resetHistory);
+        if (resetHistory) {
+          view.setState(buildCurrentState(text));
+          return;
+        }
+        var current = view.state.doc.toString();
+        if (current === text) {
+          return;
+        }
+        view.dispatch({
+          changes: { from: 0, to: current.length, insert: text },
+          annotations: [
+            resolvedCm.Transaction.userEvent.of(EXTERNAL_SYNC_USER_EVENT),
+            resolvedCm.Transaction.addToHistory.of(false),
+          ],
+        });
+      },
+      setDisabled: function (disabled) {
+        if (destroyed) {
+          return;
+        }
+        isDisabled = Boolean(disabled);
+        toggleElementClass(mountEl, 'is-disabled', isDisabled);
+        if (typeof mountEl.setAttribute === 'function') {
+          mountEl.setAttribute('aria-disabled', isDisabled ? 'true' : 'false');
+        }
+        view.dispatch({
+          effects: editableCompartment.reconfigure(buildEditableExtension(isDisabled, resolvedCm)),
+        });
+      },
+      isFocused: function () {
+        if (destroyed) {
+          return false;
+        }
+        if (view.hasFocus) {
+          return true;
+        }
+        return Boolean(
+          typeof document !== 'undefined' &&
+            view.dom &&
+            typeof view.dom.contains === 'function' &&
+            view.dom.contains(document.activeElement)
+        );
+      },
+      getMode: function () {
+        return currentMode;
+      },
+      setMode: setMode,
+      focus: function () {
+        if (!destroyed && typeof view.focus === 'function') {
+          view.focus();
+        }
+      },
+      destroy: function () {
+        if (destroyed) {
+          return;
+        }
+        destroyed = true;
+        toggleElementClass(mountEl, 'cm-mod-held', false);
+        if (win && typeof win.removeEventListener === 'function') {
+          win.removeEventListener('keydown', onWindowKeyDown);
+          win.removeEventListener('keyup', onWindowKeyUp);
+          win.removeEventListener('blur', onWindowBlur);
+        }
+        if (modeToggleEl && typeof modeToggleEl.removeEventListener === 'function') {
+          modeToggleEl.removeEventListener('click', onToggleClick);
+        }
+        if (typeof view.destroy === 'function') {
+          view.destroy();
+        }
+      },
+      isRichMode: function () {
+        return true;
+      },
+    };
+  }
+
   return {
+    NOTES_MODE_STORAGE_KEY: NOTES_MODE_STORAGE_KEY,
     isSafeHttpUrl: isSafeHttpUrl,
     isSelectionInRange: isSelectionInRange,
     isSelectionOnLine: isSelectionOnLine,
@@ -1280,5 +2297,13 @@
     computeDelimiterWrap: computeDelimiterWrap,
     computeToggleTask: computeToggleTask,
     createNotesKeymap: createNotesKeymap,
+    loadSavedNotesMode: loadSavedNotesMode,
+    saveNotesMode: saveNotesMode,
+    buildDecorationsFromSpecs: buildDecorationsFromSpecs,
+    buildDecorationSet: buildDecorationSet,
+    buildModeExtension: buildModeExtension,
+    buildEditorExtensions: buildEditorExtensions,
+    handleLinkClick: handleLinkClick,
+    createNotesEditor: createNotesEditor,
   };
 });

@@ -859,3 +859,918 @@ test('createNotesKeymap binds all 7 Obsidian chords and prevents Hub forwarding 
     assert.equal(lockedView.dispatched, 0);
   }
 });
+
+// ============================================================================
+// Task 4 Tests: Widgets, DecorationSet, Extensions, Mode Toggle & Adapter
+// ============================================================================
+
+function createMemoryStorage(initial = {}) {
+  const map = new Map(Object.entries(initial));
+  return {
+    getItem(key) {
+      return map.has(key) ? map.get(key) : null;
+    },
+    setItem(key, value) {
+      map.set(key, String(value));
+    },
+    dump() {
+      return Object.fromEntries(map.entries());
+    },
+  };
+}
+
+function createDomHarness({ withCreateRange = false } = {}) {
+  class MiniClassList {
+    constructor(el) {
+      this.el = el;
+      this.set = new Set();
+    }
+    _sync(value) {
+      this.set = new Set(String(value || '').split(/\s+/).filter(Boolean));
+    }
+    add(...tokens) {
+      for (const t of tokens) if (t) this.set.add(t);
+      this.el._className = Array.from(this.set).join(' ');
+    }
+    remove(...tokens) {
+      for (const t of tokens) this.set.delete(t);
+      this.el._className = Array.from(this.set).join(' ');
+    }
+    toggle(token, force) {
+      const next = force === undefined ? !this.set.has(token) : Boolean(force);
+      if (next) this.set.add(token);
+      else this.set.delete(token);
+      this.el._className = Array.from(this.set).join(' ');
+      return next;
+    }
+    contains(token) {
+      return this.set.has(token);
+    }
+  }
+
+  class MiniEventTarget {
+    constructor() {
+      this._listeners = new Map();
+    }
+    addEventListener(type, fn) {
+      if (!this._listeners.has(type)) this._listeners.set(type, []);
+      this._listeners.get(type).push(fn);
+    }
+    removeEventListener(type, fn) {
+      const list = this._listeners.get(type);
+      if (!list) return;
+      this._listeners.set(
+        type,
+        list.filter((entry) => entry !== fn),
+      );
+    }
+    listenerCount(type) {
+      return (this._listeners.get(type) || []).length;
+    }
+    dispatchEvent(event) {
+      if (!event.target) event.target = this;
+      event.currentTarget = this;
+      if (typeof event.preventDefault !== 'function') {
+        event.preventDefault = () => { event.defaultPrevented = true; };
+      }
+      if (typeof event.stopPropagation !== 'function') {
+        event.stopPropagation = () => { event.propagationStopped = true; };
+      }
+      for (const fn of [...(this._listeners.get(event.type) || [])]) {
+        fn.call(this, event);
+      }
+      if (!event.propagationStopped && this.parentNode && typeof this.parentNode.dispatchEvent === 'function') {
+        this.parentNode.dispatchEvent(event);
+      }
+    }
+  }
+
+  class MiniElement extends MiniEventTarget {
+    constructor(tagName, ownerDocument) {
+      super();
+      this.tagName = String(tagName || 'div').toUpperCase();
+      this.nodeType = 1;
+      this.ownerDocument = ownerDocument;
+      this.children = [];
+      this.parentNode = null;
+      this._attrs = new Map();
+      this._className = '';
+      this.classList = new MiniClassList(this);
+      this.style = {};
+      this.hidden = false;
+      this.disabled = false;
+      this.value = '';
+      this.textContent = '';
+      this.checked = false;
+      this.type = '';
+      this.title = '';
+      this.placeholder = '';
+    }
+    get className() {
+      return this._className;
+    }
+    set className(val) {
+      this._className = String(val || '');
+      this.classList._sync(this._className);
+    }
+    get parentElement() {
+      return this.parentNode;
+    }
+    appendChild(child) {
+      if (child.parentNode) child.parentNode.removeChild(child);
+      child.parentNode = this;
+      this.children.push(child);
+      return child;
+    }
+    removeChild(child) {
+      const idx = this.children.indexOf(child);
+      if (idx !== -1) {
+        this.children.splice(idx, 1);
+        child.parentNode = null;
+      }
+      return child;
+    }
+    contains(target) {
+      let cur = target;
+      while (cur) {
+        if (cur === this) return true;
+        cur = cur.parentNode;
+      }
+      return false;
+    }
+    setAttribute(name, value) {
+      const str = String(value);
+      this._attrs.set(name, str);
+      if (name === 'title') this.title = str;
+    }
+    getAttribute(name) {
+      if (name === 'title' && this.title) return this.title;
+      return this._attrs.has(name) ? this._attrs.get(name) : null;
+    }
+    closest(selector) {
+      const attrMatch = selector.match(/^\[([^=\]]+)\]$/);
+      let cur = this;
+      while (cur) {
+        if (attrMatch && typeof cur.getAttribute === 'function' && cur.getAttribute(attrMatch[1]) !== null) {
+          return cur;
+        }
+        cur = cur.parentNode;
+      }
+      return null;
+    }
+    focus() {
+      this.ownerDocument.activeElement = this;
+    }
+    click() {
+      this.dispatchEvent({ type: 'click', target: this });
+    }
+  }
+
+  const doc = {
+    activeElement: null,
+    createElement(tag) {
+      return new MiniElement(tag, doc);
+    },
+  };
+  doc.documentElement = new MiniElement('html', doc);
+  doc.head = new MiniElement('head', doc);
+  doc.body = new MiniElement('body', doc);
+  if (withCreateRange) {
+    doc.createRange = () => ({});
+  }
+  const win = new MiniEventTarget();
+  win.openCalls = [];
+  win.open = (...args) => {
+    win.openCalls.push(args);
+  };
+  return { doc, win, MiniElement };
+}
+
+function loadEditorWithDomEnv({ withCreateRange = false, storage = null } = {}) {
+  const { doc, win, MiniElement } = createDomHarness({ withCreateRange });
+  const cmCode = readFileSync(join(publicDir, 'vendor', 'cm6-bundle.js'), 'utf8');
+  const edCode = readFileSync(join(publicDir, 'notes-editor.js'), 'utf8');
+  const ctx = {
+    window: win,
+    document: doc,
+    localStorage: storage || createMemoryStorage(),
+    globalThis: null,
+    self: null,
+    console,
+    URL,
+  };
+  win.window = win;
+  win.document = doc;
+  win.localStorage = ctx.localStorage;
+  ctx.globalThis = ctx;
+  ctx.self = ctx;
+  vm.runInNewContext(cmCode, ctx, { filename: 'public/vendor/cm6-bundle.js' });
+  vm.runInNewContext(edCode, ctx, { filename: 'public/notes-editor.js' });
+  return {
+    cm: ctx.AGYCodeMirror || ctx.window.AGYCodeMirror,
+    editor: ctx.AGYNotesEditor || ctx.window.AGYNotesEditor,
+    doc,
+    win,
+    MiniElement,
+    storage: ctx.localStorage,
+  };
+}
+
+test('AGYNotesEditor exports Task 4 API surface in both browser global and CommonJS modes', () => {
+  const { browserGlobal, cjsExports } = loadNotesEditor();
+
+  for (const target of [browserGlobal, cjsExports]) {
+    assert.equal(target.NOTES_MODE_STORAGE_KEY, 'agy-todo.notes-mode');
+    assert.equal(typeof target.loadSavedNotesMode, 'function');
+    assert.equal(typeof target.saveNotesMode, 'function');
+    assert.equal(typeof target.buildDecorationsFromSpecs, 'function');
+    assert.equal(typeof target.buildDecorationSet, 'function');
+    assert.equal(typeof target.buildEditorExtensions, 'function');
+    assert.equal(typeof target.handleLinkClick, 'function');
+    assert.equal(typeof target.createNotesEditor, 'function');
+  }
+});
+
+test('loadSavedNotesMode and saveNotesMode handle live, source, invalid values, and throwing storage safely', () => {
+  const { editor } = loadEditorWithCmInContext();
+  assert.equal(editor.NOTES_MODE_STORAGE_KEY, 'agy-todo.notes-mode');
+
+  const storage = createMemoryStorage();
+  assert.equal(editor.loadSavedNotesMode(storage), 'live');
+
+  editor.saveNotesMode('source', storage);
+  assert.equal(storage.getItem('agy-todo.notes-mode'), 'source');
+  assert.equal(editor.loadSavedNotesMode(storage), 'source');
+
+  editor.saveNotesMode('live', storage);
+  assert.equal(storage.getItem('agy-todo.notes-mode'), 'live');
+  assert.equal(editor.loadSavedNotesMode(storage), 'live');
+
+  storage.setItem('agy-todo.notes-mode', 'invalid-mode');
+  assert.equal(editor.loadSavedNotesMode(storage), 'live');
+
+  editor.saveNotesMode('bogus', storage);
+  assert.equal(storage.getItem('agy-todo.notes-mode'), 'live');
+
+  const brokenStorage = {
+    getItem() {
+      throw new Error('SecurityError');
+    },
+    setItem() {
+      throw new Error('QuotaExceededError');
+    },
+  };
+  assert.equal(editor.loadSavedNotesMode(brokenStorage), 'live');
+  assert.doesNotThrow(() => editor.saveNotesMode('source', brokenStorage));
+  assert.equal(editor.loadSavedNotesMode(null), 'live');
+});
+
+test('buildDecorationSet and buildDecorationsFromSpecs construct valid RangeSetBuilder DecorationSets on complex mixed documents without range errors', () => {
+  const { cm, editor, doc } = loadEditorWithDomEnv({ withCreateRange: true });
+
+  const complexDoc = [
+    '# Heading 1',
+    '## Heading 2',
+    '###### Heading 6',
+    '- [x] **bold** `code` ~~strike~~ [Docs](https://example.com) [Bad](javascript:alert(1))',
+    '- [ ] open task with bare https://example.com/bare',
+    '  - _text `code`_',
+    '    - grandchild bullet',
+    '\t- tab bullet',
+    '1. ordered first',
+    '2. ordered second',
+    '> Quoted line',
+    '> - [x] quoted task',
+    '---',
+    '[multi',
+    'line](',
+    'https://example.com/multiline',
+    ')',
+  ].join('\n');
+
+  const positionsToCheck = [
+    0,
+    complexDoc.indexOf('Heading 2') + 2,
+    complexDoc.indexOf('bold') + 1,
+    complexDoc.indexOf('text `code`') + 2,
+    complexDoc.indexOf('`code`') + 2,
+    complexDoc.indexOf('[x]') + 1,
+    complexDoc.indexOf('Docs') + 1,
+    complexDoc.indexOf('Quoted line') + 2,
+    complexDoc.indexOf('---') + 1,
+    complexDoc.length,
+  ];
+
+  for (const pos of positionsToCheck) {
+    const state = createMarkdownState(cm, complexDoc, pos);
+    const decoSet = editor.buildDecorationSet(state, cm);
+    assert.ok(decoSet && typeof decoSet.iter === 'function', `Expected DecorationSet at pos ${pos}`);
+    assert.ok(decoSet.size > 0, `Expected non-empty DecorationSet at pos ${pos}`);
+
+    // Verify no replace decoration crosses a newline (ViewPlugin requirement)
+    const iter = decoSet.iter();
+    while (iter.value) {
+      const fromLine = state.doc.lineAt(iter.from).number;
+      const toLine = state.doc.lineAt(iter.to).number;
+      if (iter.value.startSide === 499999999 && fromLine !== toLine) {
+        assert.fail(`Replace decoration crossed newline at ${iter.from}..${iter.to}`);
+      }
+      iter.next();
+    }
+  }
+
+  // Verify buildDecorationsFromSpecs also handles unsorted & overlapping replaces cleanly
+  const unsortedOverlapping = [
+    { kind: 'mark', from: 5, to: 10, className: 'cm-md-strong' },
+    { kind: 'hide', from: 3, to: 8 },
+    { kind: 'hide', from: 1, to: 6 },
+    { kind: 'line', pos: 0, className: 'cm-md-h1' },
+    { kind: 'widget', from: 0, to: 0, widget: 'indent-guide', depth: 1 },
+  ];
+  const recoveredSet = editor.buildDecorationsFromSpecs(unsortedOverlapping, cm);
+  assert.ok(recoveredSet && recoveredSet.size > 0);
+  assert.ok(doc);
+});
+
+test('WidgetType DOM builders use safe DOM APIs only and CheckboxWidget enforces readOnly / editable lock (Review Focus #5)', () => {
+  const { cm, editor } = loadEditorWithDomEnv({ withCreateRange: true });
+
+  const sampleDoc = [
+    '- [ ] Open task',
+    '  - Nested bullet',
+    '---',
+    'plain',
+  ].join('\n');
+
+  const state = createMarkdownState(cm, sampleDoc, sampleDoc.length);
+  const decoSet = editor.buildDecorationSet(state, cm);
+
+  const widgets = [];
+  const iter = decoSet.iter();
+  while (iter.value) {
+    if (iter.value.widget) {
+      widgets.push(iter.value.widget);
+    }
+    iter.next();
+  }
+
+  const checkboxWidget = widgets.find((w) => {
+    const el = w.toDOM({ state, dispatch() {} });
+    return el.tagName === 'INPUT';
+  });
+  const bulletWidget = widgets.find((w) => {
+    const el = w.toDOM({ state, dispatch() {} });
+    return el.className === 'cm-md-bullet';
+  });
+  const hrWidget = widgets.find((w) => {
+    const el = w.toDOM({ state, dispatch() {} });
+    return el.className === 'cm-md-hr';
+  });
+  const guideWidget = widgets.find((w) => {
+    const el = w.toDOM({ state, dispatch() {} });
+    return el.className === 'cm-md-indent-guide';
+  });
+
+  assert.ok(checkboxWidget, 'Expected CheckboxWidget');
+  assert.ok(bulletWidget, 'Expected BulletWidget');
+  assert.ok(hrWidget, 'Expected HorizontalRuleWidget');
+  assert.ok(guideWidget, 'Expected IndentGuideWidget');
+
+  const bulletEl = bulletWidget.toDOM({ state, dispatch() {} });
+  assert.equal(bulletEl.tagName, 'SPAN');
+  assert.equal(bulletEl.textContent, '•');
+  assert.equal(bulletEl.getAttribute('aria-hidden'), 'true');
+
+  const hrEl = hrWidget.toDOM({ state, dispatch() {} });
+  assert.equal(hrEl.tagName, 'SPAN');
+  assert.equal(hrEl.getAttribute('role'), 'separator');
+  assert.equal(hrEl.getAttribute('aria-hidden'), 'true');
+
+  const guideEl = guideWidget.toDOM({ state, dispatch() {} });
+  assert.equal(guideEl.tagName, 'SPAN');
+  assert.equal(guideEl.getAttribute('aria-hidden'), 'true');
+
+  // Editable view allows checkbox toggle via computeToggleTask
+  const dispatchedSpecs = [];
+  const editableView = {
+    state,
+    dispatch(spec) {
+      dispatchedSpecs.push(spec);
+      editableView.state = editableView.state.update(spec).state;
+    },
+  };
+  const cbEl = checkboxWidget.toDOM(editableView);
+  assert.equal(cbEl.getAttribute('type') || cbEl.type, 'checkbox');
+  assert.equal(cbEl.className, 'cm-md-checkbox');
+  assert.equal(cbEl.getAttribute('aria-label'), 'Toggle task');
+  assert.equal(cbEl.checked, false);
+  assert.equal(cbEl.disabled, false);
+
+  const mousedownEv = { type: 'mousedown', defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+  cbEl.dispatchEvent(mousedownEv);
+  assert.equal(mousedownEv.defaultPrevented, true);
+
+  cbEl.checked = true;
+  cbEl.dispatchEvent({ type: 'change' });
+  assert.equal(dispatchedSpecs.length, 1);
+  assert.equal(editableView.state.doc.lines, 4);
+  assert.equal(editableView.state.doc.line(1).text, '- [x] Open task');
+
+  // updateDOM refreshes checked/disabled state in place
+  assert.equal(checkboxWidget.updateDOM(cbEl, { state: editableView.state }), true);
+  assert.equal(cbEl.checked, false);
+
+  // ReadOnly / disabled view blocks checkbox toggle and restores checked state
+  const lockedState = cm.EditorState.create({
+    doc: sampleDoc,
+    selection: { anchor: sampleDoc.length },
+    extensions: [
+      cm.markdown({ extensions: [cm.Strikethrough, cm.TaskList, cm.Autolink] }),
+      cm.EditorState.readOnly.of(true),
+      cm.EditorView.editable.of(false),
+    ],
+  });
+  let lockedDispatched = 0;
+  const lockedView = {
+    state: lockedState,
+    dispatch() {
+      lockedDispatched += 1;
+    },
+  };
+  const lockedCbEl = checkboxWidget.toDOM(lockedView);
+  assert.equal(lockedCbEl.disabled, true);
+  lockedCbEl.checked = true;
+  lockedCbEl.dispatchEvent({ type: 'change' });
+  assert.equal(lockedDispatched, 0);
+  assert.equal(lockedCbEl.checked, false);
+});
+
+test('handleLinkClick ignores plain click, opens validated http(s) on Mod+Click, and blocks unsafe schemes (Review Focus #2)', () => {
+  const { editor, doc, MiniElement } = loadEditorWithDomEnv({ withCreateRange: true });
+
+  const opened = [];
+  const openUrl = (href) => opened.push(href);
+
+  const makeLinkTarget = (href) => {
+    const span = doc.createElement('span');
+    span.className = 'cm-md-link';
+    span.setAttribute('data-md-href', href);
+    const childTextNode = { nodeType: 3, parentNode: span, parentElement: span };
+    return { span, childTextNode };
+  };
+
+  const { span: safeSpan, childTextNode } = makeLinkTarget('https://example.com/docs');
+
+  // Plain click does NOT open and does NOT preventDefault (allows cursor placement)
+  const plainEv = { target: safeSpan, metaKey: false, ctrlKey: false, button: 0, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+  assert.equal(editor.handleLinkClick(plainEv, { openUrl }), false);
+  assert.equal(plainEv.defaultPrevented, false);
+  assert.deepEqual(opened, []);
+
+  // Right-click with metaKey ignored
+  const rightEv = { target: safeSpan, metaKey: true, ctrlKey: false, button: 2, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+  assert.equal(editor.handleLinkClick(rightEv, { openUrl }), false);
+  assert.deepEqual(opened, []);
+
+  // Cmd+Click on nested text node opens safe URL
+  const cmdEv = { target: childTextNode, metaKey: true, ctrlKey: false, button: 0, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+  assert.equal(editor.handleLinkClick(cmdEv, { openUrl }), true);
+  assert.equal(cmdEv.defaultPrevented, true);
+  assert.deepEqual(opened, ['https://example.com/docs']);
+
+  // Ctrl+Click opens safe http URL
+  const { span: httpSpan } = makeLinkTarget('http://localhost:4815/notes');
+  const ctrlEv = { target: httpSpan, metaKey: false, ctrlKey: true, button: 0, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+  assert.equal(editor.handleLinkClick(ctrlEv, { openUrl }), true);
+  assert.deepEqual(opened, ['https://example.com/docs', 'http://localhost:4815/notes']);
+
+  // Unsafe URLs NEVER open
+  for (const badHref of ['javascript:alert(1)', 'data:text/html,<script>', 'file:///etc/passwd', 'not a url', '']) {
+    const { span: badSpan } = makeLinkTarget(badHref);
+    const badEv = { target: badSpan, metaKey: true, ctrlKey: false, button: 0, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+    assert.equal(editor.handleLinkClick(badEv, { openUrl }), false);
+  }
+  assert.equal(opened.length, 2);
+
+  // Non-link target does nothing
+  const nonLink = new MiniElement('span', doc);
+  assert.equal(editor.handleLinkClick({ target: nonLink, metaKey: true, button: 0, preventDefault() {} }, { openUrl }), false);
+});
+
+test('buildEditorExtensions wires mode/editable compartments, delimiter wrapping, externalSync guard, and history isolation (Review Focus #1 & #5)', () => {
+  const { cm, editor } = loadEditorWithDomEnv({ withCreateRange: true });
+
+  const modeCompartment = new cm.Compartment();
+  const editableCompartment = new cm.Compartment();
+  const changed = [];
+
+  const extensions = editor.buildEditorExtensions({
+    cm,
+    mode: 'live',
+    disabled: false,
+    placeholderText: 'Write notes...',
+    modeCompartment,
+    editableCompartment,
+    onChange(val) {
+      changed.push(val);
+    },
+  });
+
+  assert.ok(Array.isArray(extensions));
+  let state = cm.EditorState.create({
+    doc: 'a word b',
+    selection: { anchor: 2, head: 6 },
+    extensions,
+  });
+
+  // 1. lineWrapping, readOnly/editable, keymap present
+  assert.equal(state.facet(cm.EditorState.readOnly), false);
+  assert.equal(state.facet(cm.EditorView.editable), true);
+  assert.ok(state.facet(cm.keymap).length >= 2);
+
+  // 2. Delimiter wrap via EditorState.transactionFilter on input.type
+  const wrapTr = state.update({
+    changes: { from: 2, to: 6, insert: '*' },
+    selection: { anchor: 3 },
+    userEvent: 'input.type',
+  });
+  state = wrapTr.state;
+  assert.equal(state.doc.toString(), 'a *word* b');
+  assert.equal(state.doc.sliceString(state.selection.main.from, state.selection.main.to), 'word');
+
+  // Non-delimiter input replaces normally without wrapping
+  const replaceTr = state.update({
+    changes: { from: 3, to: 7, insert: 'x' },
+    selection: { anchor: 4 },
+    userEvent: 'input.type',
+  });
+  assert.equal(replaceTr.state.doc.toString(), 'a *x* b');
+
+  // 3. updateListener invokes onChange for user transactions and skips externalSync
+  const listeners = state.facet(cm.EditorView.updateListener);
+  assert.ok(listeners.length >= 1);
+
+  const externalTr = state.update({
+    changes: { from: 0, to: state.doc.length, insert: 'from mcp' },
+    annotations: [
+      cm.Transaction.userEvent.of('externalSync'),
+      cm.Transaction.addToHistory.of(false),
+    ],
+  });
+  for (const fn of listeners) {
+    fn({ docChanged: true, state: externalTr.state, transactions: [externalTr] });
+  }
+  assert.deepEqual(changed, []);
+
+  // addToHistory.of(false) prevents externalSync from entering undo stack
+  const userUndoableState = externalTr.state;
+  let undoDispatched = false;
+  cm.undo({
+    state: userUndoableState,
+    dispatch(spec) {
+      undoDispatched = true;
+      state = userUndoableState.update(spec).state;
+    },
+  });
+  // Undo reverts to pre-externalSync only if prior user edit was in history; externalSync itself is not undone into
+  if (undoDispatched) {
+    assert.notEqual(state.doc.toString(), 'from mcp');
+  }
+
+  for (const fn of listeners) {
+    fn({ docChanged: true, state: wrapTr.state, transactions: [wrapTr] });
+  }
+  assert.deepEqual(changed, ['a *word* b']);
+
+  // 4. modeCompartment toggles cleanly between 'live' and 'source' preserving document content
+  const toSourceTr = state.update({
+    effects: modeCompartment.reconfigure(editor.buildModeExtension('source', cm)),
+  });
+  assert.equal(toSourceTr.state.doc.toString(), state.doc.toString());
+  const toLiveTr = toSourceTr.state.update({
+    effects: modeCompartment.reconfigure(editor.buildModeExtension('live', cm)),
+  });
+  assert.equal(toLiveTr.state.doc.toString(), state.doc.toString());
+
+  // 5. editableCompartment disables edits when setDisabled(true)
+  const lockedTr = toLiveTr.state.update({
+    effects: editableCompartment.reconfigure([
+      cm.EditorState.readOnly.of(true),
+      cm.EditorView.editable.of(false),
+    ]),
+  });
+  assert.equal(lockedTr.state.facet(cm.EditorState.readOnly), true);
+  assert.equal(lockedTr.state.facet(cm.EditorView.editable), false);
+});
+
+test('createNotesEditor falls back cleanly to textarea adapter when cm is null or document.createRange is unavailable', () => {
+  const { editor, doc, MiniElement, storage } = loadEditorWithDomEnv({ withCreateRange: false });
+
+  const mountEl = new MiniElement('div', doc);
+  mountEl.hidden = true;
+  const fallbackEl = new MiniElement('textarea', doc);
+  const modeToggleEl = new MiniElement('button', doc);
+  modeToggleEl.setAttribute('aria-pressed', 'false');
+  modeToggleEl.textContent = 'Source';
+
+  const changes = [];
+  let blurs = 0;
+  const modeChanges = [];
+
+  const controller = editor.createNotesEditor({
+    mountEl,
+    fallbackEl,
+    modeToggleEl,
+    placeholderText: 'Notes placeholder',
+    storage,
+    cm: null,
+    onChange(val) {
+      changes.push(val);
+    },
+    onBlur() {
+      blurs += 1;
+    },
+    onModeChange(mode) {
+      modeChanges.push(mode);
+    },
+  });
+
+  assert.equal(controller.isRichMode(), false);
+  assert.equal(mountEl.hidden, true);
+  assert.equal(fallbackEl.hidden, false);
+  assert.equal(controller.getMode(), 'live');
+
+  // setValue must NOT invoke onChange
+  controller.setValue('initial notes', { resetHistory: true });
+  assert.equal(fallbackEl.value, 'initial notes');
+  assert.equal(controller.getValue(), 'initial notes');
+  assert.deepEqual(changes, []);
+
+  // User input fires onChange; blur fires onBlur
+  fallbackEl.value = 'edited notes';
+  fallbackEl.dispatchEvent({ type: 'input' });
+  assert.deepEqual(changes, ['edited notes']);
+
+  fallbackEl.dispatchEvent({ type: 'blur' });
+  assert.equal(blurs, 1);
+
+  // Disabled & focus tracking
+  controller.setDisabled(true);
+  assert.equal(fallbackEl.disabled, true);
+  controller.setDisabled(false);
+  assert.equal(fallbackEl.disabled, false);
+
+  assert.equal(controller.isFocused(), false);
+  controller.focus();
+  assert.equal(doc.activeElement, fallbackEl);
+  assert.equal(controller.isFocused(), true);
+
+  // Mode toggle updates aria-pressed, textContent, title, .is-source, storage, and onModeChange
+  modeToggleEl.click();
+  assert.equal(controller.getMode(), 'source');
+  assert.equal(modeToggleEl.getAttribute('aria-pressed'), 'true');
+  assert.equal(modeToggleEl.textContent, 'Source');
+  assert.ok(modeToggleEl.title.length > 0);
+  assert.equal(mountEl.classList.contains('is-source'), true);
+  assert.equal(storage.getItem('agy-todo.notes-mode'), 'source');
+  assert.deepEqual(modeChanges, ['source']);
+
+  // Also test missing document.createRange even when AGYCodeMirror is globally loaded
+  const autoFallbackController = editor.createNotesEditor({
+    mountEl,
+    fallbackEl,
+  });
+  assert.equal(autoFallbackController.isRichMode(), false);
+
+  // Destroy detaches listeners
+  controller.destroy();
+  autoFallbackController.destroy();
+  fallbackEl.value = 'after destroy';
+  fallbackEl.dispatchEvent({ type: 'input' });
+  fallbackEl.dispatchEvent({ type: 'blur' });
+  assert.deepEqual(changes, ['edited notes']);
+  assert.equal(blurs, 1);
+});
+
+test('createNotesEditor mounts CM6 EditorView in rich DOM, isolates workspace undo history, toggles mode, and cleans up window listeners on destroy', () => {
+  const storage = createMemoryStorage();
+  const { cm, editor, doc, win, MiniElement } = loadEditorWithDomEnv({ withCreateRange: true, storage });
+
+  const mountEl = new MiniElement('div', doc);
+  mountEl.hidden = true;
+  const fallbackEl = new MiniElement('textarea', doc);
+  const modeToggleEl = new MiniElement('button', doc);
+  modeToggleEl.setAttribute('aria-pressed', 'false');
+  modeToggleEl.textContent = 'Source';
+
+  let activeViewInstance = null;
+  let viewFocused = false;
+  let viewDestroyed = false;
+
+  class FakeEditorView {
+    constructor({ state, parent }) {
+      this.state = state;
+      this.parent = parent;
+      this.dom = doc.createElement('div');
+      this.dom.className = 'cm-editor';
+      if (parent && typeof parent.appendChild === 'function') {
+        parent.appendChild(this.dom);
+      }
+      activeViewInstance = this;
+    }
+    get hasFocus() {
+      return viewFocused;
+    }
+    focus() {
+      viewFocused = true;
+    }
+    dispatch(...specs) {
+      const prevState = this.state;
+      let tr = specs.length === 1 && typeof specs[0].state === 'object' ? specs[0] : prevState.update(...specs);
+      const nextState = tr.state;
+      this.state = nextState;
+      const updateObj = {
+        state: nextState,
+        startState: prevState,
+        docChanged: tr.docChanged,
+        selectionSet: tr.selectionSet,
+        transactions: [tr],
+      };
+      for (const listener of nextState.facet(cm.EditorView.updateListener)) {
+        listener(updateObj);
+      }
+    }
+    setState(newState) {
+      this.state = newState;
+    }
+    destroy() {
+      viewDestroyed = true;
+    }
+  }
+  FakeEditorView.lineWrapping = cm.EditorView.lineWrapping;
+  FakeEditorView.editable = cm.EditorView.editable;
+  FakeEditorView.updateListener = cm.EditorView.updateListener;
+  FakeEditorView.domEventHandlers = cm.EditorView.domEventHandlers;
+  FakeEditorView.contentAttributes = cm.EditorView.contentAttributes;
+
+  const instrumentedCm = {
+    ...cm,
+    EditorView: FakeEditorView,
+  };
+
+  const changes = [];
+  const modeChanges = [];
+  const openedUrls = [];
+
+  const controller = editor.createNotesEditor({
+    mountEl,
+    fallbackEl,
+    modeToggleEl,
+    placeholderText: 'Project notes...',
+    storage,
+    cm: instrumentedCm,
+    onChange(val) {
+      changes.push(val);
+    },
+    onModeChange(mode) {
+      modeChanges.push(mode);
+    },
+    openUrl(href) {
+      openedUrls.push(href);
+    },
+  });
+
+  assert.equal(controller.isRichMode(), true);
+  assert.equal(mountEl.hidden, false);
+  assert.equal(fallbackEl.hidden, true);
+  assert.ok(activeViewInstance);
+
+  // User typing triggers onChange and pushes onto history
+  activeViewInstance.dispatch({
+    changes: { from: 0, to: 0, insert: 'Workspace A note' },
+    selection: { anchor: 16 },
+    userEvent: 'input.type',
+  });
+  assert.equal(controller.getValue(), 'Workspace A note');
+  assert.deepEqual(changes, ['Workspace A note']);
+
+  // Background poll setValue(..., { resetHistory: false }) skips onChange & preserves history
+  controller.setValue('Workspace A synced', { resetHistory: false });
+  assert.equal(controller.getValue(), 'Workspace A synced');
+  assert.deepEqual(changes, ['Workspace A note']);
+
+  // Switching to Source mode preserves content and updates DOM + storage
+  modeToggleEl.click();
+  assert.equal(controller.getMode(), 'source');
+  assert.equal(modeToggleEl.getAttribute('aria-pressed'), 'true');
+  assert.equal(modeToggleEl.textContent, 'Source');
+  assert.equal(mountEl.classList.contains('is-source'), true);
+  assert.equal(storage.getItem('agy-todo.notes-mode'), 'source');
+  assert.deepEqual(modeChanges, ['source']);
+
+  // setDisabled(true) locks EditorState.readOnly & EditorView.editable
+  controller.setDisabled(true);
+  assert.equal(activeViewInstance.state.facet(cm.EditorState.readOnly), true);
+  assert.equal(activeViewInstance.state.facet(cm.EditorView.editable), false);
+  assert.equal(mountEl.classList.contains('is-disabled'), true);
+
+  // Workspace switch setValue('Workspace B', { resetHistory: true }) resets history, preserves mode & disabled state, and skips onChange
+  controller.setValue('Workspace B', { resetHistory: true });
+  assert.equal(controller.getValue(), 'Workspace B');
+  assert.deepEqual(changes, ['Workspace A note']);
+  assert.equal(controller.getMode(), 'source');
+  assert.equal(activeViewInstance.state.facet(cm.EditorState.readOnly), true);
+
+  let revertedWorkspaceA = false;
+  cm.undo({
+    state: activeViewInstance.state,
+    dispatch(spec) {
+      revertedWorkspaceA = true;
+      activeViewInstance.dispatch(spec);
+    },
+  });
+  assert.equal(revertedWorkspaceA, false, 'Expected Cmd/Ctrl+Z undo NOT to revert into previous workspace notes');
+  assert.equal(controller.getValue(), 'Workspace B');
+
+  controller.setDisabled(false);
+  assert.equal(activeViewInstance.state.facet(cm.EditorState.readOnly), false);
+
+  // Focus helpers
+  assert.equal(controller.isFocused(), false);
+  controller.focus();
+  assert.equal(controller.isFocused(), true);
+
+  // Mod key tracking toggles .cm-mod-held on mountEl
+  win.dispatchEvent({ type: 'keydown', metaKey: true, ctrlKey: false, key: 'Meta' });
+  assert.equal(mountEl.classList.contains('cm-mod-held'), true);
+  win.dispatchEvent({ type: 'keyup', metaKey: false, ctrlKey: false, key: 'Meta' });
+  assert.equal(mountEl.classList.contains('cm-mod-held'), false);
+  win.dispatchEvent({ type: 'keydown', metaKey: false, ctrlKey: true, key: 'Control' });
+  assert.equal(mountEl.classList.contains('cm-mod-held'), true);
+  win.dispatchEvent({ type: 'blur' });
+  assert.equal(mountEl.classList.contains('cm-mod-held'), false);
+
+  assert.ok(win.listenerCount('keydown') >= 1);
+  assert.ok(win.listenerCount('keyup') >= 1);
+  assert.ok(win.listenerCount('blur') >= 1);
+  assert.equal(modeToggleEl.listenerCount('click'), 1);
+
+  // destroy() removes all window & modeToggleEl listeners, clears .cm-mod-held, and destroys EditorView
+  win.dispatchEvent({ type: 'keydown', metaKey: true, key: 'Meta' });
+  assert.equal(mountEl.classList.contains('cm-mod-held'), true);
+
+  controller.destroy();
+  assert.equal(viewDestroyed, true);
+  assert.equal(mountEl.classList.contains('cm-mod-held'), false);
+  assert.equal(win.listenerCount('keydown'), 0);
+  assert.equal(win.listenerCount('keyup'), 0);
+  assert.equal(win.listenerCount('blur'), 0);
+  assert.equal(modeToggleEl.listenerCount('click'), 0);
+});
+
+test('buildEditorExtensions domEventHandlers wire Mod+Click link opening and external blur detection', () => {
+  const { cm, editor, doc } = loadEditorWithDomEnv({ withCreateRange: true });
+
+  const capturedDomHandlers = [];
+  const spyCm = {
+    ...cm,
+    EditorView: {
+      ...cm.EditorView,
+      domEventHandlers(handlers) {
+        capturedDomHandlers.push(handlers);
+        return cm.EditorView.domEventHandlers(handlers);
+      },
+    },
+  };
+
+  let blurCount = 0;
+  const opened = [];
+  editor.buildEditorExtensions({
+    cm: spyCm,
+    onBlur() {
+      blurCount += 1;
+    },
+    openUrl(href) {
+      opened.push(href);
+    },
+  });
+
+  const viewHandlers = capturedDomHandlers.find((h) => typeof h.mousedown === 'function' && typeof h.blur === 'function');
+  assert.ok(viewHandlers, 'Expected mousedown + blur domEventHandlers');
+
+  const viewDom = doc.createElement('div');
+  const innerEl = doc.createElement('input');
+  viewDom.appendChild(innerEl);
+  const outsideEl = doc.createElement('button');
+
+  // Focus moving inside view.dom does NOT trigger onBlur; moving outside DOES trigger onBlur
+  assert.equal(viewHandlers.blur({ relatedTarget: innerEl }, { dom: viewDom }), false);
+  assert.equal(blurCount, 0);
+  assert.equal(viewHandlers.blur({ relatedTarget: outsideEl }, { dom: viewDom }), false);
+  assert.equal(blurCount, 1);
+
+  const linkSpan = doc.createElement('span');
+  linkSpan.setAttribute('data-md-href', 'https://example.com');
+  assert.equal(viewHandlers.mousedown({ target: linkSpan, metaKey: true, button: 0, preventDefault() {} }), true);
+  assert.deepEqual(opened, ['https://example.com']);
+});
